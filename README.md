@@ -1,10 +1,18 @@
 # Brineglass
 
+![Brineglass cover illustration, a whale over a shipwreck](docs/media/cover.jpg)
+
 A one-bit diving demo for **Playdate**, written in C. The tour opens on a sunken ship. Follow the camera through six dive sites, or press **A** mid-flight and swim straight into the scene.
 
-<p><img src="Source/launcher/launchImage.png" width="400" alt="Brineglass launch artwork with kelp and seabed contours"> <img src="docs/media/launch.png" width="400" alt="Opening frame in the Playdate Simulator: the wreck between kelp fronds, with the view, swim and map controls visible"></p>
+**[Download Brineglass v0.5.5](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.5.5/Brineglass-0.5.5.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
 
-**[Download Brineglass v0.5.4](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.5.4/Brineglass-0.5.4.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
+## From the LCD
+
+| Opening view in Playdate Simulator | Stone whale fluke, eight seconds into the flyby |
+| --- | --- |
+| ![A sunken ship framed by kelp, with controls visible](docs/media/launch.png) | ![Jellyfish drift above the forked stone fluke between two cliffs](docs/media/fluke.png) |
+
+Both frames are shown at the native 400 × 240 resolution. The second is a direct export from the C renderer.
 
 ## Take a dive
 
