@@ -1,0 +1,8 @@
+.DS_Store
+/build/
+/*.pdx/
+/*.zip
+/Source/pdex.*
+# Local comparison exports and earlier release artwork. Published media lives in docs/.
+/*.png
+/*.gif

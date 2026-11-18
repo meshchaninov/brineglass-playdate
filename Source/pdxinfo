@@ -1,0 +1,7 @@
+name=Brineglass
+author=meshchaninov
+description=A one-bit dive through a sunken ship, kelp forests and coral gardens.
+bundleID=com.nikita.abyssalgarden
+version=0.5.4
+buildNumber=13
+imagePath=launcher
