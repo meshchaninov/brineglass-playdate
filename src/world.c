@@ -117,6 +117,66 @@ static float hull_distance(float along,float across){
     float dz=fmaxf(0,fabsf(across)-5.6f);
     return sqrtf(dx*dx+dz*dz);
 }
+/* A slab has a broad chipped crown and a steeper skirt. Sample the same
+   footprint on the 2 m height grid and the 1 m material grid at load time. */
+typedef struct {
+    float x,z,radius,width,height,cs,sn;
+} Slab;
+
+static void stamp_slab(Slab s,int material){
+    float along,across;
+    wreck_coordinates(s.x,s.z,&along,&across);
+    float bound=s.radius*1.3f;
+    if(hull_distance(along,across)<bound+5)return;
+    int spacing=material?1:2;
+    int last=material?GROUND_SAMPLES-1:GRID-1;
+    int x0=(int)clamp((s.x+EXTENT-bound)/spacing,0,last);
+    int x1=(int)clamp((s.x+EXTENT+bound)/spacing,0,last);
+    int z0=(int)clamp((s.z+EXTENT-bound)/spacing,0,last);
+    int z1=(int)clamp((s.z+EXTENT+bound)/spacing,0,last);
+    for(int j=z0;j<=z1;j++)for(int i=x0;i<=x1;i++){
+        float dx=i*spacing-EXTENT-s.x,dz=j*spacing-EXTENT-s.z;
+        float u=(dx*s.cs+dz*s.sn)/s.radius,v=(dz*s.cs-dx*s.sn)/s.width;
+        float edge=fmaxf(fabsf(u+.16f*v),fmaxf(fabsf(v-.18f*u),.70f*fabsf(u)+.68f*fabsf(v)));
+        if(edge>=1)continue;
+        float crown=.89f-.18f*u+.09f*v;
+        float height=s.height*fminf(crown,2.1f*(1-edge));
+        if(material){
+            /* Cut faces catch the overhead light. Sand shows through at the toe. */
+            float lit=clamp(.55f-(dx*.55f+dz*.72f)/s.radius,0,1);
+            float tone=126+18*lit;
+            if(2.1f*(1-edge)<crown)tone=68+59*lit;
+            float weight=clamp((1-edge)*3,0,.52f);
+            float sand=groundTone[j][i];
+            groundTone[j][i]=(uint8_t)(sand+weight*(tone-sand));
+        }else{
+            int rise=(int)(height*4+.5f);
+            if(seabed[j][i]<-8)seabed[j][i]+=(int16_t)fminf(rise,-8-seabed[j][i]);
+        }
+    }
+}
+
+static void scatter_scree(int material){
+    uint32_t savedSeed=seed;
+    seed=0x27aa641bu;
+    for(int z=-EXTENT;z<EXTENT;z+=14)for(int x=-EXTENT;x<EXTENT;x+=14){
+        float cx=x+1+12*random01(),cz=z+1+12*random01();
+        float bearing=random01()*6.2832f;
+        int count=2+(int)(3*random01());
+        for(int k=0;k<count;k++){
+            float offset=k?2+random01()*5:0;
+            float angle=bearing+2.4f*k+random01()*.8f;
+            float radius=k?1.45f+1.55f*random01():2.8f+2.1f*random01();
+            float width=radius*(.54f+.29f*random01());
+            float height=radius*(.28f+.27f*random01());
+            float turn=bearing+random01()*1.4f;
+            Slab slab={cx+offset*cosf(angle),cz+offset*sinf(angle),radius,width,height,cosf(turn),sinf(turn)};
+            stamp_slab(slab,material);
+        }
+    }
+    seed=savedSeed;
+}
+
 /* Bake contact into the tone map before lighting it. Keep the strongest
    footprint so overlapping colonies cannot turn a shelf into a black strip. */
 static void bake_contacts(void){
@@ -306,6 +366,7 @@ void generate_world(void){
         }
         seabed[j][i]=(int16_t)(h*4);
     }
+    scatter_scree(0);
     prepare_rails();
     open_passages();
     prepare_swim_bed();
@@ -364,10 +425,13 @@ void generate_world(void){
        footprint before shading the floor or indexing visible props. */
     for(int i=0;i<PROP_COUNT;i++){
         Prop *p=&props[i];
-        /* Thin the wild clusters and the planted borders before both the
-           contact bake and the spatial index consume the final population. */
-        if((i<WILD_PROPS && (i%3==1 || (p->kind==CORAL && i%3==2))) ||
-           (i>=WILD_PROPS && p->kind==CORAL && i%3==1)){
+        /* Keep the gaps between tall colonies open. Low, partly buried stones
+           share the existing prop slots, terrain clipping and distance fade. */
+        if(i<WILD_PROPS && i%3==1){
+            p->size=.75f+.11f*p->phase;
+            p->kind=BOULDER;
+            p->p=attachment(p->p.x,p->p.z,BOULDER,p->size);
+        }else if(p->kind==CORAL && (i<WILD_PROPS?i%3==2:i%3==1)){
             p->kind=EMPTY_PROP;
             continue;
         }
@@ -388,6 +452,7 @@ void generate_world(void){
     }
     bake_stone();
     shade_ground();
+    scatter_scree(1);
 }
 float floor_at(float x,float z){
     float gx=clamp((x+EXTENT)*.5f,0,GRID-1.001f),gz=clamp((z+EXTENT)*.5f,0,GRID-1.001f);
