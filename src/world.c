@@ -1,4 +1,5 @@
 #include "garden.h"
+#include "wreck.h"
 #include "stone.h"
 #include <math.h>
 
@@ -109,6 +110,12 @@ static float rock_noise(float x,float z){
     float c=rock_corner(i,j+1),d=rock_corner(i+1,j+1);
     return (1-v)*(a+(b-a)*u)+v*(c+(d-c)*u);
 }
+/* Distance to the rectangle swept by the hull planks, in ship coordinates. */
+static float hull_distance(float along,float across){
+    float dx=fmaxf(0,fmaxf(-16-along,along-17));
+    float dz=fmaxf(0,fabsf(across)-5.6f);
+    return sqrtf(dx*dx+dz*dz);
+}
 /* Static light is attached to the terrain so the LCD pattern describes the same
    reef when the camera turns. The quarter-metre heights are in world space. */
 static void shade_ground(void){
@@ -128,7 +135,7 @@ static void shade_ground(void){
     /* Soft contact darkening follows the actual slope below each holdfast or colony. */
     for(int i=0;i<PROP_COUNT;i++){
         const Prop *p=&props[i];
-        if(p->kind==BUBBLES)continue;
+        if(p->kind==BUBBLES || p->kind==EMPTY_PROP)continue;
         float r=p->kind==KELP?1.3f+p->size*.045f:1.25f+p->size*.80f;
         float cx=p->p.x+EXTENT,cz=p->p.z+EXTENT;
         int loX=(int)clamp(floorf(cx-r),0,GROUND_SAMPLES-1),hiX=(int)clamp(ceilf(cx+r),0,GROUND_SAMPLES-1);
@@ -187,11 +194,22 @@ void generate_world(void){
             h+=2.65f*(shelf-f)*clamp((h-base-2)*.19f,0,1);
         }
         /* A sandbank cradles the keel. Keep the approach open toward the deck. */
-        float sx=x-59.5f,sz=z-6;
-        float along=sx*.90f+sz*.43f,across=-sx*.43f+sz*.90f;
+        float along,across;
+        wreck_coordinates(x,z,&along,&across);
         float bank=clamp(1-(along*along/550+across*across/125),0,1);
         float clearing=clamp(1-(along*along/970+across*across/300),0,1);
         h=fmaxf(h-clearing*6,base+bank*(17-.12f*along));
+        /* Leave a continuous sand sill under the keel. Recess the surrounding
+           reef beyond the hull too, so an oblique depth slice cannot sample
+           the high shoulder behind the ship and bring it through a plank. */
+        float shore=hull_distance(along,across);
+        if(shore<20){
+            float keel=WRECK_Y+.17f*fabsf(along)-.12f*along-6.86f;
+            float sill=fminf(keel,-30.f)-1.3f*fminf(8,fabsf(across))+.12f*block;
+            float blend=clamp((shore-6)/14,0,1);
+            blend=blend*blend*(3-2*blend);
+            h-=(1-blend)*fmaxf(0,h-sill);
+        }
         seabed[j][i]=(int16_t)(h*4);
     }
     prepare_rails();
@@ -246,6 +264,16 @@ void generate_world(void){
         Vec p=attachment(x,z,kind,scale);
         scale=fminf(scale,1.25f+fmaxf(0,distance_to_flight(p)-2.8f)*2);
         props[WILD_PROPS+site*20+k]=(Prop){p,scale,random01()*6.2832f,kind};
+    }
+    /* Placement can move a colony onto a neighbouring ledge. Check its final
+       footprint before shading the floor or indexing visible props. */
+    for(int i=0;i<PROP_COUNT;i++){
+        Prop *p=&props[i];
+        if(p->kind==BUBBLES)continue;
+        float along,across;
+        wreck_coordinates(p->p.x,p->p.z,&along,&across);
+        float radius=p->kind==KELP?.46f*p->size+.6f:1.1f*p->size;
+        if(hull_distance(along,across)<radius+1)p->kind=EMPTY_PROP;
     }
     for(int i=0;i<HABITAT_COUNT;i++){
         Diver lens={0};

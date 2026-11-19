@@ -5,7 +5,7 @@ enum { SHOT_SECONDS=16, WIDTH=200, HEIGHT=120, GRID=161, EXTENT=160, SITE_COUNT=
 typedef struct { float x,y,z; } Vec;
 typedef struct { Vec p; float yaw, pitch, time, velocity; } Diver;
 typedef struct { const char *name; float x,z, aimX,aimZ, altitude,pitch; } Site;
-typedef enum { KELP, SPONGE, CORAL, BOULDER, BUBBLES } Species;
+typedef enum { KELP, SPONGE, CORAL, BOULDER, BUBBLES, EMPTY_PROP } Species;
 typedef struct { Vec p; float size, phase; Species kind; } Prop;
 typedef struct { float x,y,z,yaw,radius,tube,stretch; } Arch;
 extern const Site sites[SITE_COUNT];

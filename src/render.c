@@ -1,4 +1,5 @@
 #include "garden.h"
+#include "wreck.h"
 #include "stone.h"
 #include "coral.h"
 #include <math.h>
@@ -401,9 +402,6 @@ static void pole(Vec from,Vec to,float w,int tone){
     quad(a,b,c,d,tone);
 }
 /* Hull stations, planks and spars use the proportions of the original wreck. */
-static Vec ship(float x,float y,float z){
-    return (Vec){59.5f+x*.90f-z*.43f,-23+y-.12f*x+.14f*z,6+x*.43f+z*.90f};
-}
 static void wreck(void){
     const float stations[]={-16,-13,-8,0,8,13,17};
     const float widths[]={2.6f,4.6f,5.3f,5.6f,4.8f,3.2f,.15f};
@@ -877,6 +875,7 @@ static void index_props(void){
     for(int i=0;i<PROP_COUNT;i++){
         /* The tour has its own planted borders. Leave clear water between
            wild clusters and keep large fronds from hiding the animals. */
+        if(props[i].kind==EMPTY_PROP)continue;
         if(i<WILD_PROPS && (i%3==1 || (props[i].kind==CORAL && i%3==2)))continue;
         if(i>=WILD_PROPS && props[i].kind==CORAL && i%3==1)continue;
         const Vec p=props[i].p;
@@ -1263,7 +1262,7 @@ void render(const Diver *d,uint8_t *frame,int stride){
     tick=(int)(d->time*19);
     water();terrain();
     memset(bucketHead,0xff,sizeof bucketHead);commandCount=0;
-    Camera shipPos=camera((Vec){59.5f,-23,6}),flukePos=camera((Vec){-5,-38,-4});
+    Camera shipPos=camera((Vec){WRECK_X,WRECK_Y,WRECK_Z}),flukePos=camera((Vec){-5,-38,-4});
     if(shipPos.z>-23 && shipPos.z<TERRAIN_RANGE+23 && fabsf(shipPos.x)<shipPos.z+42)draw_model(&landmarks[0]);
     if(flukePos.z>-10 && flukePos.z<TERRAIN_RANGE+10 && fabsf(flukePos.x)<flukePos.z+18)draw_model(&landmarks[1]);
     for(int i=0;i<3;i++){
