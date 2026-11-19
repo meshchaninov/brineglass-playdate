@@ -917,6 +917,7 @@ static void marine_snow(void){
 /* Build the silhouette in world space so that a turn of the camera also
    turns a side view into a head-on or tail-on view. */
 static void draw_fish(Vec center,Vec velocity){
+    guide_swimmer(&center,&velocity,1.9f);
     Camera f=camera(center);
     if(f.z<1 || f.z>REEF_RANGE || fabsf(f.x)>f.z+1)return;
     float flat=sqrtf(velocity.x*velocity.x+velocity.z*velocity.z);
@@ -1043,7 +1044,6 @@ static void reef_life(void){
                 float t=angle+.13f*(k/3),s=motion_sin(t),c=motion_cos(t);
                 float radius=4.3f+(k%3)*.67f;
                 Vec fish={home.x+radius*c,home.y+.26f*(k%5)+.45f*motion_sin(t*2+k),home.z+radius*s};
-                if(fish.y<floor_at(fish.x,fish.z)+.5f || fish.y>-.5f)continue;
                 draw_fish(fish,(Vec){-radius*s,.90f*motion_cos(t*2+k),radius*c});
             }
         }else if(i==3 || i==7 || i==9){
@@ -1063,10 +1063,19 @@ static void reef_life(void){
 
 /* Each encounter stays in world space during both the tour and free swim.
    A swimmer's local +z follows the tangent to its path. */
-typedef struct { Vec p; float forwardX,forwardZ,scale; } Swimmer;
+typedef struct { Vec p; float forwardX,forwardZ,scale,pitchSin,pitchCos; } Swimmer;
 static Vec body_point(Swimmer s,float x,float y,float z){
-    return (Vec){s.p.x+s.scale*(s.forwardZ*x+s.forwardX*z),s.p.y+s.scale*y,
-                 s.p.z+s.scale*(s.forwardZ*z-s.forwardX*x)};
+    float forward=s.pitchCos*z-s.pitchSin*y;
+    return (Vec){s.p.x+s.scale*(s.forwardZ*x+s.forwardX*forward),
+                 s.p.y+s.scale*(s.pitchSin*z+s.pitchCos*y),
+                 s.p.z+s.scale*(s.forwardZ*forward-s.forwardX*x)};
+}
+/* verticalSlope is dy per metre along the original horizontal orbit. */
+static void follow_reef(Swimmer *s,float verticalSlope,float clearance){
+    Vec tangent={s->forwardX,verticalSlope,s->forwardZ};
+    guide_swimmer(&s->p,&tangent,clearance);
+    s->pitchCos=1.f/sqrtf(1+tangent.y*tangent.y);
+    s->pitchSin=tangent.y*s->pitchCos;
 }
 static int swimmer_visible(Vec p,float radius){
     Camera c=camera(p);
@@ -1174,7 +1183,7 @@ static void encounters_at_reef(void){
             Swimmer s={{e->home.x+e->axisX*u-e->axisZ*w,
                         e->home.y+.51f*motion_sin(1.6f*t+.44f*n),
                         e->home.z+e->axisZ*u+e->axisX*w},
-                       (e->axisX*du-e->axisZ*dw)*inv,(e->axisZ*du+e->axisX*dw)*inv,1};
+                       (e->axisX*du-e->axisZ*dw)*inv,(e->axisZ*du+e->axisX*dw)*inv,1,0,1};
             if(e->kind==SQUID_POD){
                 static const float height[]={-.9f,.48f,-.28f,1.34f,.22f};
                 static const float offset[]={-.75f,.8f,-.4f,.45f,-.9f};
@@ -1182,16 +1191,15 @@ static void encounters_at_reef(void){
                 s.p.y+=height[n];
             }
             if(e->kind==SILVER_SCHOOL)s.p.y+=.35f*lane;
-            float ground=floor_at(s.p.x,s.p.z);
+            float clearance=e->kind==SHARK_PATROL?4.4f:e->kind==SQUID_POD?2.9f:1.9f;
+            follow_reef(&s,.51f*1.6f*motion_cos(1.6f*t+.44f*n)*inv,clearance);
             if(e->kind==SHARK_PATROL){
                 s.scale=1.15f;
-                s.p.y=fmaxf(s.p.y,ground+2.f);
                 if(s.p.y< -1.4f && swimmer_visible(s.p,3))reef_shark(s,beat);
             }else if(e->kind==SQUID_POD){
                 s.scale=1.02f+.12f*lane;
-                s.p.y=fmaxf(s.p.y,ground+1.4f);
                 if(s.p.y< -1 && swimmer_visible(s.p,1.7f))squid(s,motion_sin(beat));
-            }else if(s.p.y>ground+.8f && s.p.y<-.8f && swimmer_visible(s.p,.7f)){
+            }else if(s.p.y<-.8f && swimmer_visible(s.p,.7f)){
                 /* A school banks as a wave: each flank catches the light
                    just after its neighbour. Tail and nose follow the orbit. */
                 Vec nose=body_point(s,0,0,.45f),tail=body_point(s,0,0,-.35f);
@@ -1207,37 +1215,45 @@ static void encounters_at_reef(void){
 }
 
 static void animals(void){
-    static const float paths[][5]={{1,-28,3.5f,14,3.012f},{49,-24,24.5f,10,.6f},
-        {0,-24,-80,28,.3f},{-50,-29,20,22,5},{10,-28,86,22,2.2f},{20,-20,-20,38,4.2f}};
+    /* The widest orbits turn inside the submerged side of the kelp,
+       canyon and grotto shelves, leaving room for the full wingspan. */
+    static const struct { Vec school; float rayX,rayZ,radius,phase; } paths[]={
+        {{1,-28,3.5f},1,3.5f,14,3.012f}, {{49,-24,24.5f},49,24.5f,10,.6f},
+        {{0,-24,-80},0,-66,18,.3f}, {{-56,-29,18},-54,34,12,5},
+        {{10,-28,86},9,92,12,2.2f}, {{20,-20,-20},20,-20,38,4.2f}
+    };
     for(int i=0;i<6;i++){
-        const float *p=paths[i];
-        float a=view->time*.069f+p[4],c=motion_cos(a),s=motion_sin(a);
-        Vec m={p[0]+p[3]*c,p[1]+motion_sin(a*2)*.7f,p[2]+p[3]*s};
-        Camera cam=camera(m);
+        Vec home=paths[i].school;
+        float a=view->time*.069f+paths[i].phase,c=motion_cos(a),s=motion_sin(a);
+        Vec m={paths[i].rayX+paths[i].radius*c,home.y+motion_sin(a*2)*.7f,paths[i].rayZ+paths[i].radius*s};
+        Swimmer ray={m,-s,c,1,0,1};
+        float halfSpan=4.4f+.22f*i;
+        follow_reef(&ray,1.4f*motion_cos(a*2)/paths[i].radius,halfSpan+3.4f);
+        Camera cam=camera(ray.p);
         if(cam.z>-6 && cam.z<REEF_RANGE+5 && fabsf(cam.x)<cam.z+7){
-            Vec nose={m.x-s*1.6f,m.y+.3f,m.z+c*1.6f},back={m.x+s*1.7f,m.y,m.z-c*1.7f};
-            Vec tail={m.x+s*4.5f,m.y-.3f,m.z-c*4.5f};
+            Vec nose=body_point(ray,0,.3f,1.6f),back=body_point(ray,0,0,-1.7f);
+            Vec tail=body_point(ray,0,-.3f,-4.5f);
             for(int side=-1;side<=1;side+=2){
-                float flap=motion_sin(view->time*1.65f+i),w=(4.4f+.22f*i)*side;
-                Vec joint={m.x+c*w*.43f,m.y+.7f,m.z+s*w*.43f};
-                Vec wing={m.x+c*w+s*.8f,m.y+flap*1.8f,m.z+s*w-c*.8f};
-                Vec leading={m.x+c*w*.57f-s*.64f,m.y+.65f+flap*.48f,m.z+s*w*.57f+c*.64f};
+                float flap=motion_sin(view->time*1.65f+i),w=halfSpan*side;
+                Vec joint=body_point(ray,w*.43f,.7f,0);
+                Vec wing=body_point(ray,w,flap*1.8f,-.8f);
+                Vec leading=body_point(ray,w*.57f,.65f+flap*.48f,.64f);
                 face(nose,joint,back,23);face(nose,leading,joint,76);
                 face(leading,wing,joint,62);face(back,joint,wing,40);
-                Vec root={back.x+c*side*.28f,back.y,back.z+s*side*.28f};
-                face(m,root,tail,26);
+                Vec root=body_point(ray,side*.28f,0,-1.7f);
+                face(ray.p,root,tail,26);
             }
         }
         /* A school moves on its own path below each ray. */
         float driftSin=motion_sin(a*.9f),driftCos=motion_cos(a*.9f);
-        Camera school=camera((Vec){p[0]+9*driftSin,p[1]-5,p[2]+9*driftCos});
+        Camera school=camera((Vec){home.x+9*driftSin,home.y-5,home.z+9*driftCos});
         if(school.z < -8 || school.z>REEF_RANGE+8 || fabsf(school.x)>school.z+16)continue;
         for(int k=0;k<15;k++){
             float angle=a*1.5f+k*2.4f;
             float turnSin=motion_sin(angle),turnCos=motion_cos(angle);
-            Vec fish={p[0]+9*driftSin+5*turnCos+(k%3)*1.1f,
-                      p[1]-5+1.3f*motion_sin(angle*1.3f),
-                      p[2]+9*driftCos+4*turnSin};
+            Vec fish={home.x+9*driftSin+5*turnCos+(k%3)*1.1f,
+                      home.y-5+1.3f*motion_sin(angle*1.3f),
+                      home.z+9*driftCos+4*turnSin};
             /* Tangent to this fish's full path, including the school's drift. */
             Vec velocity={9*.9f*driftCos-5*1.5f*turnSin,
                           1.3f*1.3f*1.5f*motion_cos(angle*1.3f),

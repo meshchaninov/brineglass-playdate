@@ -166,6 +166,70 @@ static Vec attachment(float x,float z,Species kind,float size){
     }
     return (Vec){ax,floor_at(ax,az)-.2f,az};
 }
+/* Give each ridge a rounded approach on every side. A quadratic falloff
+   keeps high cliffs from lifting animals across the whole neighbouring bay.
+   The separable maximum works on signed quarter-metre heights. */
+static int16_t swimBed[GRID][GRID];
+
+static void spread_ridge(int16_t line[GRID]){
+    int16_t expanded[GRID];
+    for(int i=0;i<GRID;i++){
+        int best=line[i];
+        int first=i>10?i-10:0,last=i+10<GRID?i+10:GRID-1;
+        for(int j=first;j<=last;j++){
+            int distance=i-j;
+            int candidate=line[j]-3*distance*distance;
+            if(candidate>best)best=candidate;
+        }
+        expanded[i]=best;
+    }
+    for(int i=0;i<GRID;i++)line[i]=expanded[i];
+}
+
+static void prepare_swim_bed(void){
+    for(int j=0;j<GRID;j++){
+        for(int i=0;i<GRID;i++)swimBed[j][i]=seabed[j][i];
+        spread_ridge(swimBed[j]);
+    }
+    int16_t column[GRID];
+    for(int i=0;i<GRID;i++){
+        for(int j=0;j<GRID;j++)column[j]=swimBed[j][i];
+        spread_ridge(column);
+        for(int j=0;j<GRID;j++)swimBed[j][i]=column[j];
+    }
+}
+
+/* Central quadratic B-spline: a continuous tangent through grid boundaries.
+   Return the height and its derivative in the horizontal travel direction. */
+static void swim_weights(float t,float w[3]){
+    w[0]=.5f*(1-t)*(1-t);
+    w[2]=.5f*t*t;
+    w[1]=1-w[0]-w[2];
+}
+
+void guide_swimmer(Vec *p,Vec *velocity,float clearance){
+    float gx=clamp((p->x+EXTENT)*.5f+.5f,1,GRID-1.001f);
+    float gz=clamp((p->z+EXTENT)*.5f+.5f,1,GRID-1.001f);
+    int i=(int)gx,j=(int)gz;
+    float u=gx-i,v=gz-j,wx[3],wz[3];
+    swim_weights(u,wx);swim_weights(v,wz);
+    float row[3],dx=0;
+    for(int k=0;k<3;k++){
+        const int16_t *a=&swimBed[j+k-1][i-1];
+        row[k]=a[0]*wx[0]+a[1]*wx[1]+a[2]*wx[2];
+        dx+=wz[k]*((1-u)*(a[1]-a[0])+u*(a[2]-a[1]));
+    }
+    float bed=.25f*(row[0]*wz[0]+row[1]*wz[1]+row[2]*wz[2]);
+    float dz=(1-v)*(row[1]-row[0])+v*(row[2]-row[1]);
+    float rise=.125f*(dx*velocity->x+dz*velocity->z);
+    /* Smooth maximum over two metres. Its derivative steers the nose into
+       the climb and hands the original swimming motion back over open water. */
+    float target=bed+clearance;
+    float blend=clamp(.5f+.25f*(target-p->y),0,1);
+    p->y+=(target-p->y)*blend+2*blend*(1-blend);
+    velocity->y+=(rise-velocity->y)*blend;
+}
+
 void generate_world(void){
     seed=72561;
     for(int j=0;j<GRID;j++) for(int i=0;i<GRID;i++){
@@ -214,6 +278,7 @@ void generate_world(void){
     }
     prepare_rails();
     open_passages();
+    prepare_swim_bed();
     const float beds[][4]={{0,-86,40,0},{72,-26,26,0},{-32,-5,15,0},
         {-60,5,20,1},{6,84,29,2},{5,-4,20,0},{57,14,23,0},{-40,44,24,0}};
     for(int i=0;i<WILD_PROPS;i++){

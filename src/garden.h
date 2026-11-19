@@ -18,6 +18,7 @@ enum { GROUND_SAMPLES=EXTENT*2+1 };
 extern uint8_t groundTone[GROUND_SAMPLES][GROUND_SAMPLES];
 void generate_world(void);
 float floor_at(float x,float z);
+void guide_swimmer(Vec *p,Vec *velocity,float clearance);
 void visit(Diver *d,int site);
 void swim(Diver *d,float forward,float steer,float rise,float look,float dt);
 void demo_pose(Diver *d,int site,float elapsed);
