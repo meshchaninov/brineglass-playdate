@@ -155,6 +155,17 @@ static void shade_ground(void){
         float gx=(x-5)/29.f,gz=(z-86)/39.f;
         float sand=clamp(1-gx*gx-gz*gz,0,1)/(1+.8f*slope);
         tone+=sand*(154+6*sun+3*grain-tone);
+        float along,across;
+        wreck_coordinates(x,z,&along,&across);
+        if(fabsf(along)<31 && fabsf(across)<19){
+            /* A light sand apron outlines the darker wood. The narrow contact
+               shadow tapers around the ends of the embedded planking. */
+            float end=fmaxf(0,fabsf(along)-10);
+            float apron=clamp(1-across*across/300.f-end*end/320.f,0,1);
+            tone+=apron*(149+8*sun+3*grain-tone);
+            float shadow=clamp(1-across*across/35.f-end*end/70.f,0,1);
+            tone-=22*shadow*shadow;
+        }
         groundTone[j][i]=(uint8_t)clamp(tone-groundTone[j][i],36,163);
     }
 }
@@ -275,9 +286,8 @@ void generate_world(void){
         float bank=clamp(1-(along*along/550+across*across/125),0,1);
         float clearing=clamp(1-(along*along/970+across*across/300),0,1);
         h=fmaxf(h-clearing*6,base+bank*(17-.12f*along));
-        /* Leave a continuous sand sill under the keel. Recess the surrounding
-           reef beyond the hull too, so an oblique depth slice cannot sample
-           the high shoulder behind the ship and bring it through a plank. */
+        /* Cut the high reef back first, including the shoulders reached by
+           oblique depth slices. Rebuild the support from the keel profile. */
         float shore=hull_distance(along,across);
         if(shore<20){
             float keel=WRECK_Y+.17f*fabsf(along)-.12f*along-6.86f;
@@ -285,6 +295,14 @@ void generate_world(void){
             float blend=clamp((shore-6)/14,0,1);
             blend=blend*blend*(3-2*blend);
             h-=(1-blend)*fmaxf(0,h-sill);
+            /* Feather the sides and both ends of the sandbar into the bed. */
+            float station=clamp(along,-15,16);
+            float keelHeight=ship(station,.17f*fabsf(station)-7,0).y;
+            float side=across-.8f*block;
+            float end=fmaxf(0,fabsf(along-.5f)-11);
+            float shoulder=clamp(1-side*side/295.f-end*end/350.f,0,1);
+            float bed=base+shoulder*(keelHeight+1.35f+.17f*block-base);
+            h=fmaxf(h,bed);
         }
         seabed[j][i]=(int16_t)(h*4);
     }

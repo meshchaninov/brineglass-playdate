@@ -442,6 +442,26 @@ static void wreck(void){
     quad(ship(-15,2,2.8f),ship(-8,2,4.4f),ship(-8,5,4.4f),ship(-15,5.6f,2.8f),46);
     quad(ship(-15,5.6f,-2.8f),ship(-8,5,-4.4f),ship(-8,5,4.4f),ship(-15,5.6f,2.8f),89);
 }
+static void outcrop(Vec center,float radius,float height,int seed,int light);
+
+/* Broken bedrock protrudes through the sand on both sides of the keel.
+   Build it with the wreck so the static projection and culling are shared. */
+static void wreck_site(void){
+    static const struct {float along,across,radius,height;} stones[]={
+        {-14.6f,2.2f,3.8f,1.35f}, {-12.3f,4.9f,2.0f,.75f},
+        {-6.4f,3.1f,4.9f,1.7f}, {-2.6f,5.6f,2.3f,.70f},
+        {6.5f,1.8f,5.1f,.64f}, {10.4f,4.4f,2.25f,.85f},
+        {15.6f,1.8f,2.3f,.8f}, {-16.8f,6.4f,1.8f,.75f},
+        {-9,-3.3f,4.2f,1.4f}, {3.8f,-3.3f,4.9f,.95f}
+    };
+    wreck();
+    for(unsigned i=0;i<sizeof stones/sizeof *stones;i++){
+        Vec p=ship(stones[i].along,0,stones[i].across);
+        p.y=floor_at(p.x,p.z);
+        outcrop(p,stones[i].radius,stones[i].height,17+i*73,16);
+    }
+}
+
 /* Span runs across the two lobes; positive depth faces the Whale fluke viewpoint. */
 static Vec fluke_point(float ground,float span,float height,float depthOffset){
     return (Vec){-5+.967f*span-.255f*depthOffset,ground+height,-4+.255f*span+.967f*depthOffset};
@@ -535,7 +555,7 @@ static ModelBounds model_bounds(Model *m,int first,int end,uint32_t *mask){
 }
 static void build_landmarks(void){
     Diver reference={0};visit(&reference,1);view=&reference;
-    building=&landmarks[0];wreck();
+    building=&landmarks[0];wreck_site();
     building=&landmarks[1];fluke();
     for(int i=0;i<3;i++){building=&landmarks[2+i];stone_arch(&arches[i]);}
     building=NULL;
@@ -572,7 +592,7 @@ static int classify_bounds(const ModelBounds *box){
 static void draw_model(const Model *model){
     if(model->overflow){
         int id=(int)(model-landmarks);
-        if(id==0)wreck();else if(id==1)fluke();else stone_arch(&arches[id-2]);
+        if(id==0)wreck_site();else if(id==1)fluke();else stone_arch(&arches[id-2]);
         return;
     }
     int visibility=classify_bounds(&model->bounds);
@@ -652,7 +672,7 @@ static void kelp_leaf(Sprite s,float x,float y,float dx,float dy,float curl,int 
    screen-facing quad with a horizontal base would hang out over the downhill side. */
 static const float rockX[6]={1,.50f,-.50f,-1,-.50f,.50f};
 static const float rockZ[6]={0,.866f,.866f,0,-.866f,-.866f};
-static void outcrop(Vec center,float radius,float height,int seed){
+static void outcrop(Vec center,float radius,float height,int seed,int light){
     Vec foot[6],rim[6];
     Vec peak={center.x+radius*.12f,center.y+height,center.z-radius*.08f};
     for(int j=0;j<6;j++){
@@ -666,8 +686,8 @@ static void outcrop(Vec center,float radius,float height,int seed){
     for(int j=0;j<6;j++){
         int k=(j+1)%6;
         int sun=(int)(rockX[j]*8+rockZ[j]*15);
-        quad(foot[j],foot[k],rim[k],rim[j],77-sun);
-        face(rim[j],rim[k],peak,112-sun);
+        quad(foot[j],foot[k],rim[k],rim[j],77+light-sun);
+        face(rim[j],rim[k],peak,112+light-sun);
     }
 }
 static void sponge(const Prop *p){
@@ -850,7 +870,7 @@ static void plant(const Prop *p){
     if(pos.y<0 || pos.y-(p->kind==CORAL?1.7f:1.f)*h*s.scale>meshScale*HEIGHT+2)return;
     switch(p->kind){
     case KELP:
-        if(c.z<3)outcrop(p->p,.45f+h*.026f,.45f+h*.024f,phase);
+        if(c.z<3)outcrop(p->p,.45f+h*.026f,.45f+h*.024f,phase,0);
         {Command *cmd=submit(KELP_CMD,s.iz,0);if(cmd){cmd->kelp.s=s;cmd->kelp.h=h;cmd->kelp.phase=phase;}}
         break;
     case SPONGE:
@@ -858,11 +878,11 @@ static void plant(const Prop *p){
         else sponge_lod(s,h);
         break;
     case CORAL:
-        if(c.z<3)outcrop(p->p,h*.48f,h*.28f,phase);
+        if(c.z<3)outcrop(p->p,h*.48f,h*.28f,phase,0);
         {Command *cmd=submit(CORAL_CMD,s.iz,0);if(cmd){cmd->coral.p=p;cmd->coral.base=c;cmd->coral.variant=phase;}}
         break;
     case BOULDER:
-        if(c.z<7)outcrop(p->p,h*.90f,h*.65f,phase);
+        if(c.z<7)outcrop(p->p,h*.90f,h*.65f,phase,0);
         else distant_rock(s,h,phase);
         break;
     default:break;
