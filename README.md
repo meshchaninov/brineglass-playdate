@@ -4,7 +4,7 @@
 
 A one-bit diving demo for **Playdate**, written in C. The tour opens on a sunken ship. Follow the camera through six dive sites, or press **A** mid-flight and swim straight into the scene.
 
-**[Download Brineglass v0.6.0](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.6.0/Brineglass-0.6.0.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
+**[Download Brineglass v0.7.0](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.7.0/Brineglass-0.7.0.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
 
 ## From the LCD
 
@@ -12,13 +12,17 @@ A one-bit diving demo for **Playdate**, written in C. The tour opens on a sunken
 | --- | --- |
 | ![A sunken ship framed by kelp, with controls visible](docs/media/launch.png) | ![Jellyfish drift above the forked stone fluke between two cliffs](docs/media/fluke.png) |
 
-Both frames are shown at the native 400 × 240 resolution. The second is a direct export from the C renderer.
+| Reef shark in the kelp channel | Squid above the coral shelf |
+| --- | --- |
+| ![A reef shark swims above the kelp](docs/media/reef-shark.png) | ![A pod of squid swims above the coral](docs/media/squid.png) |
+
+The opening screenshot comes from v0.7.0 running in Playdate Simulator. The other frames are native 400 × 240 exports from the v0.7.0 C renderer.
 
 ## Take a dive
 
 On a Playdate, upload the release ZIP to your [Sideload page](https://play.date/account/sideload/), then download Brineglass on the console. On an Apple silicon Mac, unzip the archive and open **Brineglass.pdx** in Playdate Simulator. For another simulator platform, build from source.
 
-A loop lasts 96 seconds. It leads from the **shipwreck** into the **kelp forest**, past the **stone whale fluke**, through **sponge canyon** and the **coral grotto**, and out to the **pillar grove**. Manta rays, fish, turtles and jellyfish move through the same world in free swim.
+A loop lasts 96 seconds. It leads from the **shipwreck** into the **kelp forest**, past the **stone whale fluke**, through **sponge canyon** and the **coral grotto**, and out to the **pillar grove**. Reef sharks patrol the wreck and kelp channel. Squid pulse through the canyon and grotto, and two silver schools wheel past the fluke and pillars. You can follow them in free swim alongside the rays, turtles and jellyfish.
 
 | Control | On tour | In free swim |
 | --- | --- | --- |
@@ -35,10 +39,10 @@ Brineglass draws each frame directly into the **400 × 240** one-bit framebuffer
 
 The water projection samples wave and shaft intensities at the corners of 8 × 4 light patches. It interpolates the light across native scanlines and dithers eight LCD pixels into one byte. Triangle edges use fixed-point arithmetic. Sprites and facets are drawn from far to near, and the coral atlas skips transparent texels. The tour and free swim share this renderer.
 
-| Physical Playdate, v0.6.0, sound enabled | Result |
+| Physical Playdate, v0.7.0, sound enabled | Result |
 | --- | ---: |
-| Complete six-site tour | 2,910 frames in 95.999 s · **30.31 FPS** |
-| Longest update, including controls, overlays and audio | 25 ms |
+| Complete six-site tour | 2,910 frames in 95.998 s · **30.31 FPS** |
+| Longest update, including controls, overlays and audio | 28 ms |
 | Updates over 33 ms | 0 |
 
 [Timings for each site](docs/rendering.ru.md) · [Same camera in v0.5.5 and v0.6.0](docs/media/native-comparison.png)

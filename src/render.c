@@ -1062,6 +1062,151 @@ static void reef_life(void){
     }
 }
 
+/* Each encounter stays in world space during both the tour and free swim.
+   A swimmer's local +z follows the tangent to its path. */
+typedef struct { Vec p; float forwardX,forwardZ,scale; } Swimmer;
+static Vec body_point(Swimmer s,float x,float y,float z){
+    return (Vec){s.p.x+s.scale*(s.forwardZ*x+s.forwardX*z),s.p.y+s.scale*y,
+                 s.p.z+s.scale*(s.forwardZ*z-s.forwardX*x)};
+}
+static int swimmer_visible(Vec p,float radius){
+    Camera c=camera(p);
+    if(c.z+radius<.9f || c.z>REEF_RANGE || fabsf(c.x)>c.z*.92f+radius*1.5f)return 0;
+    if(c.z<=radius+1)return 1;
+    Screen v=project(c);
+    float extent=220.f*radius/(c.z-radius);
+    return !hidden((int)(v.x-extent)-1,(int)(v.y-extent)-1,
+                   (int)(v.x+extent)+1,(int)(v.y+extent)+1,(int)(32760/(c.z-radius))+2);
+}
+static void reef_shark(Swimmer s,float phase){
+    /* Snout, shoulder, waist and caudal peduncle. The travelling lateral
+       wave gets wider towards the tail while the head barely moves. */
+    static const float sections[][4]={
+        {1.88f,.08f,.06f,.01f},{1.18f,.34f,.29f,.025f},{.28f,.41f,.37f,.055f},
+        {-.83f,.26f,.25f,.15f},{-1.61f,.09f,.10f,.32f}
+    };
+    Vec ring[5][4];float bend[5];
+    for(int i=0;i<5;i++){
+        const float *v=sections[i];
+        bend[i]=v[3]*motion_sin(phase-i*.52f);
+        ring[i][0]=body_point(s,bend[i],v[2],v[0]);
+        ring[i][1]=body_point(s,bend[i]+v[1],0,v[0]);
+        ring[i][2]=body_point(s,bend[i],-v[2],v[0]);
+        ring[i][3]=body_point(s,bend[i]-v[1],0,v[0]);
+        if(i)for(int j=0;j<4;j++){
+            int k=(j+1)&3;
+            quad(ring[i-1][j],ring[i][j],ring[i][k],ring[i-1][k],j==1||j==2?127:62);
+        }
+    }
+    face(ring[0][0],ring[0][1],ring[0][2],81);face(ring[0][0],ring[0][2],ring[0][3],81);
+    face(ring[2][0],body_point(s,bend[2],1.02f,-.20f),body_point(s,bend[3],.21f,-.55f),45);
+    for(int side=-1;side<=1;side+=2){
+        face(body_point(s,side*.30f,-.07f,.67f),body_point(s,side*1.08f,-.27f,-.36f),
+             body_point(s,side*.27f,-.12f,-.11f),51);
+    }
+    float tail=.60f*motion_sin(phase-2.65f);
+    Vec fork=body_point(s,tail*.86f,.05f,-1.97f);
+    face(ring[4][0],body_point(s,tail,.90f,-2.44f),fork,48);
+    face(ring[4][2],fork,body_point(s,tail,-.50f,-2.25f),59);
+    face(ring[4][0],fork,ring[4][2],57);
+}
+static void squid(Swimmer s,float pulse){
+    /* Mantle first on the power stroke. The swept fins and two long arms
+       stay legible when the animal turns broadside to the camera. */
+    float width=.25f+.055f*pulse;
+    Vec tip=body_point(s,0,.08f,1.09f+.12f*pulse);
+    Vec collar=body_point(s,0,-.02f,-.38f);
+    Vec rim[4]={body_point(s,0,width,.23f),body_point(s,width,0,.23f),
+                body_point(s,0,-width,.23f),body_point(s,-width,0,.23f)};
+    for(int j=0;j<4;j++){
+        int k=(j+1)&3;
+        face(tip,rim[j],rim[k],j==0||j==3?104:57);
+        face(collar,rim[k],rim[j],j==0||j==3?84:48);
+    }
+    for(int side=-1;side<=1;side+=2){
+        face(tip,body_point(s,side*.49f,.03f+.08f*pulse,.42f),
+             body_point(s,side*.19f,0,.04f),76);
+    }
+    Vec head=body_point(s,0,-.01f,-.62f);
+    /* The eye sits on the visible cheek, just behind the mantle opening. */
+    float side=(view->p.x-s.p.x)*s.forwardZ-(view->p.z-s.p.z)*s.forwardX;
+    Camera eye=camera(body_point(s,side<0?-.15f:.15f,.015f,-.33f));
+    if(eye.z>1 && eye.z<22){
+        Screen v=project(eye);
+        Sprite disc={v.x,v.y,220.f*s.scale/eye.z,v.iz,eye.z};
+        oval(disc,0,0,.13f,.125f,179);
+        oval(disc,0,0,.074f,.072f,38);
+    }
+    for(int j=-1;j<=1;j++){
+        Vec root=body_point(s,.12f*j,.07f,-.31f);
+        Vec knee=body_point(s,j*(.18f+.07f*pulse),-.08f-.06f*j,-.81f);
+        Vec end=body_point(s,j*(.26f+.11f*pulse),.08f*pulse,-1.26f+.19f*(j==0));
+        face(root,head,knee,55);
+        face(head,knee,end,61);
+    }
+}
+typedef enum { SHARK_PATROL, SQUID_POD, SILVER_SCHOOL } EncounterKind;
+typedef struct { Vec home; float axisX,axisZ,phase; EncounterKind kind; } Encounter;
+static const Encounter encounters[]={
+    {{57,-13,25},1,0,1.1f,SHARK_PATROL},          /* Over the wreck's bow */
+    {{-11,-26,-79},.52f,-.854f,-1.6f,SHARK_PATROL}, /* Across the kelp channel */
+    {{-13,-33,3},1,0,-4.9f,SILVER_SCHOOL},        /* Beside the stone fluke */
+    {{-59,-32.7f,12},1,0,-12.8f,SQUID_POD},           /* Through the sponge canyon */
+    {{3,-33.5f,85.5f},1,0,-16.5f,SQUID_POD},             /* Above the coral shelf */
+    {{-17,-24,-110},.18f,.984f,-12.2f,SILVER_SCHOOL}
+};
+static void encounters_at_reef(void){
+    for(unsigned i=0;i<sizeof encounters/sizeof *encounters;i++){
+        const Encounter *e=&encounters[i];
+        Camera c=camera(e->home);
+        if(c.z< -15 || c.z>REEF_RANGE+15 || fabsf(c.x)>c.z+25 || fabsf(c.y)>44)continue;
+        int count=e->kind==SHARK_PATROL?1:e->kind==SQUID_POD?5:28;
+        float speed=e->kind==SHARK_PATROL?.21f:e->kind==SQUID_POD?.23f:.29f;
+        for(int n=0;n<count;n++){
+            int rank=n/4,lane=n%4;
+            float t=view->time*speed+e->phase-rank*.18f;
+            float beat=view->time*(e->kind==SQUID_POD?3.8f:2.9f)+i+1.4f*n;
+            if(e->kind==SQUID_POD)t+=.19f*(n-2)+.042f*motion_sin(beat);
+            float along=motion_sin(t),across=motion_cos(t);
+            float major=e->kind==SHARK_PATROL?8.5f:6.4f;
+            float minor=3.f+(count>1?.48f*lane:0);
+            float u=major*along,w=minor*across;
+            float du=major*across,dw=-minor*along,inv=1/sqrtf(du*du+dw*dw);
+            Swimmer s={{e->home.x+e->axisX*u-e->axisZ*w,
+                        e->home.y+.51f*motion_sin(1.6f*t+.44f*n),
+                        e->home.z+e->axisZ*u+e->axisX*w},
+                       (e->axisX*du-e->axisZ*dw)*inv,(e->axisZ*du+e->axisX*dw)*inv,1};
+            if(e->kind==SQUID_POD){
+                static const float height[]={-.9f,.48f,-.28f,1.34f,.22f};
+                static const float offset[]={-.75f,.8f,-.4f,.45f,-.9f};
+                s.p.x-=e->axisZ*offset[n];s.p.z+=e->axisX*offset[n];
+                s.p.y+=height[n];
+            }
+            if(e->kind==SILVER_SCHOOL)s.p.y+=.35f*lane;
+            float ground=floor_at(s.p.x,s.p.z);
+            if(e->kind==SHARK_PATROL){
+                s.scale=1.15f;
+                s.p.y=fmaxf(s.p.y,ground+2.f);
+                if(s.p.y< -1.4f && swimmer_visible(s.p,3))reef_shark(s,beat);
+            }else if(e->kind==SQUID_POD){
+                s.scale=1.02f+.12f*lane;
+                s.p.y=fmaxf(s.p.y,ground+1.4f);
+                if(s.p.y< -1 && swimmer_visible(s.p,1.7f))squid(s,motion_sin(beat));
+            }else if(s.p.y>ground+.8f && s.p.y<-.8f && swimmer_visible(s.p,.7f)){
+                /* A school banks as a wave: each flank catches the light
+                   just after its neighbour. Tail and nose follow the orbit. */
+                Vec nose=body_point(s,0,0,.45f),tail=body_point(s,0,0,-.35f);
+                Vec ridge=body_point(s,0,.105f,0),belly=body_point(s,0,-.115f,0);
+                Vec flank=body_point(s,.075f*motion_sin(t),0,.06f);
+                int flash=(int)(49*fmaxf(0,motion_cos(3*t+.36f*lane)));
+                face(nose,ridge,tail,67);face(nose,belly,flank,135+flash);
+                face(flank,belly,tail,119+flash);
+                face(tail,body_point(s,0,.14f,-.57f),body_point(s,0,-.14f,-.57f),63);
+            }
+        }
+    }
+}
+
 static void animals(void){
     static const float paths[][5]={{1,-28,3.5f,14,3.012f},{49,-24,24.5f,10,.6f},
         {0,-24,-80,28,.3f},{-50,-29,20,22,5},{10,-28,86,22,2.2f},{20,-20,-20,38,4.2f}};
@@ -1125,7 +1270,7 @@ void render(const Diver *d,uint8_t *frame,int stride){
         Camera p=camera((Vec){arches[i].x,arches[i].y,arches[i].z});
         if(p.z>-18 && p.z<TERRAIN_RANGE+18 && fabsf(p.x)<p.z+36)draw_model(&landmarks[2+i]);
     }
-    draw_plants();animals();reef_life();marine_snow();
+    draw_plants();animals();reef_life();encounters_at_reef();marine_snow();
     for(int b=0;b<BUCKETS;b++)for(int id=bucketHead[b];id>=0;id=commands[id].next){
         const Command *cmd=&commands[id];
         switch(cmd->type){
