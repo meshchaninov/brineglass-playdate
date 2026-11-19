@@ -35,3 +35,10 @@ check-swimmers: build/check_swimmers
 
 build/check_swimmers: tests/swimmer_clearance.c $(SCENE) src/garden.h src/wreck.h src/stone.h src/coral.h
 	$(HOSTCC) -O3 -std=c11 -Isrc $< $(filter-out src/render.c,$(SCENE)) -lm -o $@
+
+.PHONY: check-grotto
+check-grotto: build/check_grotto
+	$<
+
+build/check_grotto: tests/grotto_ground.c $(SCENE) src/garden.h src/wreck.h src/stone.h src/coral.h
+	$(HOSTCC) -O3 -std=c11 -Isrc $< $(filter-out src/render.c,$(SCENE)) -lm -o $@

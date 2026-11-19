@@ -2,6 +2,7 @@
 #include "wreck.h"
 #include "stone.h"
 #include <math.h>
+#include <string.h>
 
 const Site sites[SITE_COUNT]={
     {"Whale fluke",-8,12,-5,-4,2.7f,.29f},
@@ -116,9 +117,29 @@ static float hull_distance(float along,float across){
     float dz=fmaxf(0,fabsf(across)-5.6f);
     return sqrtf(dx*dx+dz*dz);
 }
-/* Static light is attached to the terrain so the LCD pattern describes the same
-   reef when the camera turns. The quarter-metre heights are in world space. */
+/* Bake contact into the tone map before lighting it. Keep the strongest
+   footprint so overlapping colonies cannot turn a shelf into a black strip. */
+static void bake_contacts(void){
+    memset(groundTone,0,sizeof groundTone);
+    for(int i=0;i<PROP_COUNT;i++){
+        const Prop *p=&props[i];
+        if(p->kind==BUBBLES || p->kind==EMPTY_PROP)continue;
+        float r=p->kind==KELP?.9f+p->size*.035f:.8f+p->size*.45f;
+        int strength=p->kind==BOULDER?19:14;
+        float cx=p->p.x+EXTENT,cz=p->p.z+EXTENT;
+        int loX=(int)clamp(floorf(cx-r),0,GROUND_SAMPLES-1),hiX=(int)clamp(ceilf(cx+r),0,GROUND_SAMPLES-1);
+        int loZ=(int)clamp(floorf(cz-r),0,GROUND_SAMPLES-1),hiZ=(int)clamp(ceilf(cz+r),0,GROUND_SAMPLES-1);
+        for(int j=loZ;j<=hiZ;j++)for(int k=loX;k<=hiX;k++){
+            float dx=k-cx,dz=j-cz,weight=1-(dx*dx+dz*dz)/(r*r);
+            if(weight<=0)continue;
+            int shade=(int)(strength*weight*weight+.5f);
+            if(shade>groundTone[j][k])groundTone[j][k]=(uint8_t)shade;
+        }
+    }
+}
+
 static void shade_ground(void){
+    bake_contacts();
     for(int j=0;j<GROUND_SAMPLES;j++)for(int i=0;i<GROUND_SAMPLES;i++){
         float x=i-EXTENT,z=j-EXTENT,h=floor_at(x,z);
         float dx=(floor_at(x+1,z)-floor_at(x-1,z))*.5f;
@@ -128,22 +149,13 @@ static void shade_ground(void){
         float grain=sinf(x*.95f+z*.28f+1.7f*sinf(z*.49f))+
                     .65f*cosf(.41f*x-1.1f*z);
         float tone=124-21*rock+sun*(16+10*rock)+grain*(3+3*rock);
-        /* The coarse material survives even in the cheapest render mode. */
         tone+=.47f*rock*stone_sample((int)(x*STONE_UNITS),(int)(h*STONE_UNITS),(int)(z*STONE_UNITS));
-        groundTone[j][i]=(uint8_t)clamp(tone,36,163);
-    }
-    /* Soft contact darkening follows the actual slope below each holdfast or colony. */
-    for(int i=0;i<PROP_COUNT;i++){
-        const Prop *p=&props[i];
-        if(p->kind==BUBBLES || p->kind==EMPTY_PROP)continue;
-        float r=p->kind==KELP?1.3f+p->size*.045f:1.25f+p->size*.80f;
-        float cx=p->p.x+EXTENT,cz=p->p.z+EXTENT;
-        int loX=(int)clamp(floorf(cx-r),0,GROUND_SAMPLES-1),hiX=(int)clamp(ceilf(cx+r),0,GROUND_SAMPLES-1);
-        int loZ=(int)clamp(floorf(cz-r),0,GROUND_SAMPLES-1),hiZ=(int)clamp(ceilf(cz+r),0,GROUND_SAMPLES-1);
-        for(int j=loZ;j<=hiZ;j++)for(int k=loX;k<=hiX;k++){
-            float dx=k-cx,dz=j-cz,weight=1-(dx*dx+dz*dz)/(r*r);
-            if(weight>0)groundTone[j][k]=(uint8_t)fmaxf(44,groundTone[j][k]-40*weight*weight);
-        }
+        /* Fine pale sediment settles on the grotto floor. The steep walls
+           retain their rock material, even in the middle of the coral bed. */
+        float gx=(x-5)/29.f,gz=(z-86)/39.f;
+        float sand=clamp(1-gx*gx-gz*gz,0,1)/(1+.8f*slope);
+        tone+=sand*(154+6*sun+3*grain-tone);
+        groundTone[j][i]=(uint8_t)clamp(tone-groundTone[j][i],36,163);
     }
 }
 static float ground_slope(float x,float z,float radius){
@@ -334,6 +346,13 @@ void generate_world(void){
        footprint before shading the floor or indexing visible props. */
     for(int i=0;i<PROP_COUNT;i++){
         Prop *p=&props[i];
+        /* Thin the wild clusters and the planted borders before both the
+           contact bake and the spatial index consume the final population. */
+        if((i<WILD_PROPS && (i%3==1 || (p->kind==CORAL && i%3==2))) ||
+           (i>=WILD_PROPS && p->kind==CORAL && i%3==1)){
+            p->kind=EMPTY_PROP;
+            continue;
+        }
         if(p->kind==BUBBLES)continue;
         float along,across;
         wreck_coordinates(p->p.x,p->p.z,&along,&across);

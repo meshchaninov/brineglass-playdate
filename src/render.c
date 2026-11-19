@@ -873,11 +873,7 @@ static int16_t firstProp[CELL_COUNT][CELL_COUNT],nextProp[PROP_COUNT];
 static void index_props(void){
     memset(firstProp,0xff,sizeof firstProp);
     for(int i=0;i<PROP_COUNT;i++){
-        /* The tour has its own planted borders. Leave clear water between
-           wild clusters and keep large fronds from hiding the animals. */
         if(props[i].kind==EMPTY_PROP)continue;
-        if(i<WILD_PROPS && (i%3==1 || (props[i].kind==CORAL && i%3==2)))continue;
-        if(i>=WILD_PROPS && props[i].kind==CORAL && i%3==1)continue;
         const Vec p=props[i].p;
         int x=max2(0,min2(CELL_COUNT-1,(int)((p.x+EXTENT)/CELL_WIDTH)));
         int z=max2(0,min2(CELL_COUNT-1,(int)((p.z+EXTENT)/CELL_WIDTH)));

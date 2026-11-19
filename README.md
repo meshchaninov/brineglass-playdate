@@ -4,7 +4,7 @@
 
 A one-bit diving demo for **Playdate**, written in C. The tour opens on a sunken ship. Follow the camera through six dive sites, or press **A** mid-flight and swim straight into the scene.
 
-**[Download Brineglass v0.7.2](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.7.2/Brineglass-0.7.2.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
+**[Download Brineglass v0.7.3](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.7.3/Brineglass-0.7.3.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
 
 ## From the LCD
 
@@ -16,7 +16,7 @@ A one-bit diving demo for **Playdate**, written in C. The tour opens on a sunken
 | --- | --- |
 | ![A reef shark swims above the kelp](docs/media/reef-shark.png) | ![A pod of squid swims above the coral](docs/media/squid.png) |
 
-The opening screenshot comes from v0.7.1 running in Playdate Simulator. The other frames are native 400 × 240 exports from the v0.7.2 C renderer.
+The opening screenshot comes from v0.7.1 running in Playdate Simulator. The other frames are native 400 × 240 exports from the v0.7.3 C renderer.
 
 ## Take a dive
 
@@ -41,9 +41,9 @@ Brineglass draws each frame directly into the **400 × 240** one-bit framebuffer
 
 The water projection samples wave and shaft intensities at the corners of 8 × 4 light patches. It interpolates the light across native scanlines and dithers eight LCD pixels into one byte. Triangle edges use fixed-point arithmetic. Sprites and facets are drawn from far to near, and the coral atlas skips transparent texels. The tour and free swim share this renderer.
 
-| Physical Playdate, v0.7.2, sound enabled | Result |
+| Physical Playdate, v0.7.3, sound enabled | Result |
 | --- | ---: |
-| Complete six-site tour | 2,910 frames in 95.998 s · **30.31 FPS** |
+| Complete six-site tour | 2,910 frames in 95.997 s · **30.31 FPS** |
 | Longest update, including controls, overlays and audio | 25 ms |
 | Updates over 33 ms | 0 |
 
