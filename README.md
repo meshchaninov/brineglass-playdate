@@ -35,6 +35,8 @@ On the map, choose a site with up / down and confirm with A. The system menu let
 
 ## Inside the renderer
 
+[How Brineglass renders an underwater world in 33 ms (article in Russian)](docs/optimization.ru.md)
+
 Brineglass draws each frame directly into the **400 × 240** one-bit framebuffer. The seabed advances from near to far. Each depth slice updates a horizon for every LCD column, so the next slice only fills newly visible rock. The same horizons clip kelp, coral branches and fish against the terrain. The Cortex-M7 compares four column heights per instruction using unsigned byte arithmetic.
 
 The water projection samples wave and shaft intensities at the corners of 8 × 4 light patches. It interpolates the light across native scanlines and dithers eight LCD pixels into one byte. Triangle edges use fixed-point arithmetic. Sprites and facets are drawn from far to near, and the coral atlas skips transparent texels. The tour and free swim share this renderer.
