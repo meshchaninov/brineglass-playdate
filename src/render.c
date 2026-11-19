@@ -33,12 +33,32 @@ static inline float motion_wave(float index){
 }
 static inline float motion_sin(float angle){return motion_wave(angle*(TRIG_STEPS/6.283185307f));}
 static inline float motion_cos(float angle){return motion_wave(angle*(TRIG_STEPS/6.283185307f)+TRIG_STEPS/4);}
-static uint8_t seaTile[64][64];
+static uint8_t seaTile[64][64],waterTone[LCD_H/4][LCD_W/8];
 /* Eight native samples of a linear light ramp at the LCD's Bayer phase. */
 enum { RAMP_RADIUS=12 };
 static uint8_t rampInk[2*RAMP_RADIUS+1][256][4];
+/* A stationary screen-door pattern, independent of the four-pixel ink pattern.
+   Within every Bayer phase all sixteen coarse ranks occur once per tile. */
+enum { COVER_STEPS=64 };
+typedef struct {uint8_t low,high;} Coverage;
+static const Coverage opaque={0,COVER_STEPS};
+static Coverage detailCover={0,COVER_STEPS},drawCover={0,COVER_STEPS};
+static uint16_t coverRows[COVER_STEPS+1][16];
+static uint8_t landmarkCover[4096],reefCover[4096];
+static const uint8_t *rangeCover=landmarkCover;
+
+static int visibility(float z,float clear,float limit){
+    float t=clampf((limit-z)/(limit-clear),0,1);
+    return (int)(COVER_STEPS*t*t*(3-2*t)+.5f);
+}
 static void init_tables(void){
     static const uint8_t bayer[4][4]={{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
+    for(int y=0;y<16;y++)for(int x=0;x<16;x++){
+        int phase=bayer[y&3][x&3];
+        int rank=4*((bayer[y>>2][x>>2]+phase*7)&15)+(phase>>2);
+        uint16_t bit=(uint16_t)(128u>>(x&7))<<((x>>3)*8);
+        for(int level=rank+1;level<=COVER_STEPS;level++)coverRows[level][y]|=bit;
+    }
     for(int i=0;i<TRIG_STEPS;i++)motionTable[i]=sinf(i*(6.283185307f/TRIG_STEPS));
     motionTable[TRIG_STEPS]=motionTable[0];
     for(int i=0;i<256;i++){
@@ -100,6 +120,7 @@ static void water(void){
             int grad=min2(RAMP_RADIUS,max2(-RAMP_RADIUS,((r-l)+(cur[col+1]-cur[col]))/8));
             int tone=(l+r)*4;
             int dy=cur[col]+cur[col+1]-l-r;
+            waterTone[y/4-1][col]=(tone+2*dy+4)>>3;
             const uint8_t (*ramp)[4]=rampInk[grad+RAMP_RADIUS];
             uint8_t *out=lcd+(y-4)*pitchBytes+col;
             for(int j=0;j<4;j++,tone+=dy)out[j*pitchBytes]=ramp[(tone+(dy/2)+4)>>3][j];
@@ -107,7 +128,7 @@ static void water(void){
     }
 }
 enum { RINGS=32, BAND=8, BANDS=LCD_W/BAND };
-typedef struct {float z,inv; int key,fog;} Ring;
+typedef struct {float z,inv; int key,fog,coverage;} Ring;
 static Ring rings[RINGS];
 static int ringCount;
 static uint8_t roof[RINGS+1][LCD_W],roofMin[RINGS+1][BANDS],roofMax[RINGS+1][BANDS];
@@ -119,7 +140,7 @@ static Knot knots[RINGS][BANDS+1];
 static void terrain_tables(void){
     for(float z=1.2f;ringCount<RINGS;){
         z=fminf(z,TERRAIN_RANGE);
-        rings[ringCount++]=(Ring){z,220.f/z,(int)(32760/z),(int)(clampf((z-12)/62,0,1)*230)};
+        rings[ringCount++]=(Ring){z,220.f/z,(int)(32760/z),(int)(clampf((z-12)/62,0,1)*230),visibility(z,45,TERRAIN_RANGE-1)};
         if(z>=TERRAIN_RANGE)break;
         z+=1.0f+z*.105f;
     }
@@ -127,7 +148,10 @@ static void terrain_tables(void){
         int key=i*8+4,k=0;
         while(k<ringCount && rings[k].key>key)k++;
         ringForKey[i]=k;
-        float t=clampf((32760.f/key-CLEAR_RANGE)/(TERRAIN_RANGE-CLEAR_RANGE),0,1);
+        float z=32760.f/key;
+        landmarkCover[i]=visibility(z,45,TERRAIN_RANGE-1);
+        reefCover[i]=visibility(z,19,REEF_RANGE-2);
+        float t=clampf((z-CLEAR_RANGE)/(TERRAIN_RANGE-CLEAR_RANGE),0,1);
         fogForKey[i]=(uint8_t)(248*t*t*(3-2*t));
     }
     memset(roof[0],LCD_H,LCD_W);memset(roofMin[0],LCD_H,BANDS);memset(roofMax[0],LCD_H,BANDS);
@@ -209,11 +233,13 @@ static void terrain(void){
                 for(int y=nextLow;y<high;){
                     int end=min2(high,(y|3)+1);
                     int tone=base+((strata[texRow[y/4]][phase]*rock)>>8);
-                    tone+=((waterRow[y]-tone)*fog)>>8;
+                    tone+=((waterTone[y/4][band]-tone)*fog)>>8;
                     const uint8_t *pattern=ramp[min2(255,max2(0,tone))];
                     for(;y<end;y++,out+=pitchBytes){
                         unsigned mask=(y<low?255:edge_bits(previous,y));
                         if(y<nextHigh)mask&=~edge_bits(top,y);
+                        if(rings[k].coverage<COVER_STEPS)
+                            mask&=coverRows[rings[k].coverage][y&15]>>(8*(band&1));
                         *out^=(*out^pattern[y&3])&mask;
                     }
                 }
@@ -254,6 +280,20 @@ static inline void stroke(int y,int left,int right,Brush pen){
     int a=left>>3,b=(right-1)>>3;
     unsigned last=(255u<<(7-((right-1)&7)))&255;
     uint8_t *row=lcd+y*pitchBytes;
+    if(drawCover.low || drawCover.high<COVER_STEPS){
+        uint16_t holes=coverRows[drawCover.high][y&15]^coverRows[drawCover.low][y&15];
+        for(int i=a;i<=b;i++){
+            unsigned bits=mask & (holes>>(8*(i&1)));
+            if(i==b)bits&=last;
+            if(y>=pen.clearUntil && y>=roofMin[pen.ring][i]){
+                if(y>=roofMax[pen.ring][i])bits=0;
+                else bits&=edge_bits(roof[pen.ring]+i*8,y);
+            }
+            row[i]^=(row[i]^pattern)&bits;
+            mask=255;
+        }
+        return;
+    }
     if(y<pen.clearUntil){
         if(a==b){row[a]^=(row[a]^pattern)&(mask&last);return;}
         row[a]^=(row[a]^pattern)&mask;
@@ -281,6 +321,7 @@ enum { TRI_CMD, OVAL_CMD, KELP_CMD, CORAL_CMD, SNOW_CMD, JELLY_CMD, BUCKETS=1024
 typedef struct {
     int16_t next;
     uint8_t type,tone;
+    Coverage coverage;
     union {
         Screen v[3];
         struct {Sprite s;float x,y,rx,ry;} oval;
@@ -294,12 +335,15 @@ static Command commands[MAX_COMMANDS];
 static int16_t bucketHead[BUCKETS],bucketTail[BUCKETS];
 static int commandCount;
 static Command *submit(int type,float key,int tone){
-    if(commandCount==MAX_COMMANDS)return NULL;
+    int binKey=min2(4095,max2(0,(int)key)>>3);
+    int high=min2(detailCover.high,rangeCover[binKey]);
+    if(high<=detailCover.low || commandCount==MAX_COMMANDS)return NULL;
     /* Logarithmic inverse-depth buckets retain fine ordering close to the eye. */
     uint32_t bits;memcpy(&bits,&key,sizeof bits);
     int bin=min2(BUCKETS-1,max2(0,(int)(bits>>17)-(134<<6)));
     int id=commandCount++;
     Command *cmd=&commands[id];cmd->type=type;cmd->tone=tone;cmd->next=-1;
+    cmd->coverage=(Coverage){detailCover.low,high};
     if(bucketHead[bin]<0)bucketHead[bin]=id;
     else commands[bucketTail[bin]].next=id;
     bucketTail[bin]=id;
@@ -849,7 +893,16 @@ static void distant_rock(Sprite s,float h,int phase){
 }
 static void plant(const Prop *p){
     Camera c=camera(p->p);
-    if(c.z<1.5f || c.z>REEF_RANGE || fabsf(c.x)>c.z*.95f+6)return;
+    if(c.z>REEF_RANGE)return;
+    if(c.z<=1.5f){
+        /* World-space facets can straddle the lens even when their anchor
+           is behind it. Let the normal near-plane clipper trim these. */
+        if(c.z < -p->size || fabsf(c.x)>2+p->size*1.2f)return;
+        if(p->kind==BOULDER)outcrop(p->p,p->size*.90f,p->size*.65f,(int)(p->phase*40),0);
+        else if(p->kind==SPONGE)sponge(p);
+        return;
+    }
+    int nearLens=COVER_STEPS-visibility(c.z,1.5f,3.5f);
     Screen pos=project(c);
     Sprite s={pos.x,pos.y,meshScale*focal/c.z,pos.iz,c.z};
     float h=p->size;
@@ -863,30 +916,40 @@ static void plant(const Prop *p){
         for(int i=0;i<5;i++){
             float t=fmodf(view->time*1.05f+i*4+p->phase,20);
             float x=(sine((int)(t*9)+phase)-127)*.005f;
+            detailCover.high=min2(nearLens,COVER_STEPS-visibility(fminf(t,20-t),0,2));
             oval(s,x,t,.09f+t*.009f,.11f+t*.008f,216);
         }
-        return;
+        detailCover=opaque;return;
     }
-    if(pos.y<0 || pos.y-(p->kind==CORAL?1.7f:1.f)*h*s.scale>meshScale*HEIGHT+2)return;
+    if(pos.y+bounds<0 || pos.y-reach*s.scale-bounds>LCD_H)return;
+    /* Both LODs occupy complementary pixels during the change. */
+    int near=visibility(c.z,p->kind==BOULDER?5:2.5f,p->kind==BOULDER?11:6);
+    int plantCover=(p->kind==KELP || p->kind==CORAL)?nearLens:COVER_STEPS;
+    detailCover=(Coverage){0,min2(near,plantCover)};
     switch(p->kind){
     case KELP:
-        if(c.z<3)outcrop(p->p,.45f+h*.026f,.45f+h*.024f,phase,0);
+        if(near)outcrop(p->p,.45f+h*.026f,.45f+h*.024f,phase,0);
+        detailCover=(Coverage){0,plantCover};
         {Command *cmd=submit(KELP_CMD,s.iz,0);if(cmd){cmd->kelp.s=s;cmd->kelp.h=h;cmd->kelp.phase=phase;}}
         break;
     case SPONGE:
-        if(c.z<3)sponge(p);
-        else sponge_lod(s,h);
+        if(near)sponge(p);
+        detailCover=(Coverage){near,COVER_STEPS};
+        if(near<COVER_STEPS)sponge_lod(s,h);
         break;
     case CORAL:
-        if(c.z<3)outcrop(p->p,h*.48f,h*.28f,phase,0);
+        if(near)outcrop(p->p,h*.48f,h*.28f,phase,0);
+        detailCover=(Coverage){0,plantCover};
         {Command *cmd=submit(CORAL_CMD,s.iz,0);if(cmd){cmd->coral.p=p;cmd->coral.base=c;cmd->coral.variant=phase;}}
         break;
     case BOULDER:
-        if(c.z<7)outcrop(p->p,h*.90f,h*.65f,phase,0);
-        else distant_rock(s,h,phase);
+        if(near)outcrop(p->p,h*.90f,h*.65f,phase,0);
+        detailCover=(Coverage){near,COVER_STEPS};
+        if(near<COVER_STEPS)distant_rock(s,h,phase);
         break;
     default:break;
     }
+    detailCover=opaque;
 }
 enum { CELL_WIDTH=20, CELL_COUNT=2*EXTENT/CELL_WIDTH };
 static int16_t firstProp[CELL_COUNT][CELL_COUNT],nextProp[PROP_COUNT];
@@ -922,10 +985,17 @@ static void marine_snow(void){
         z+=period*floorf((view->p.z-z)/period+.5f);
         Camera cam=camera((Vec){x,y,z});
         if(cam.z<1.6f || cam.z>15 || fabsf(cam.x)>cam.z)continue;
+        float dx=x-view->p.x,dy=y-view->p.y,dz=z-view->p.z;
+        /* Finish fading before any axis of the periodic particle field wraps. */
+        int visible=min2(visibility(dx*dx+dy*dy+dz*dz,9*9,15*15),
+                         COVER_STEPS-visibility(cam.z,1.6f,3.f));
+        if(!visible)continue;
         Screen v=project(cam);
         int sx=(int)v.x,sy=(int)v.y;
         if(sx>=0 && sx<meshScale*WIDTH && sy>=0 && sy<meshScale*HEIGHT){
+            detailCover=(Coverage){0,visible};
             Command *cmd=submit(SNOW_CMD,v.iz,182+(i%4)*12);
+            detailCover=opaque;
             if(cmd){cmd->snow.x=sx;cmd->snow.y=sy;cmd->snow.key=(int)v.iz;}
         }
     }
@@ -941,7 +1011,9 @@ static void draw_fish(Vec center,Vec velocity){
     if(length<.0001f)return;
     Vec forward={velocity.x/length,velocity.y/length,velocity.z/length};
     Vec side=flat>.0001f?(Vec){velocity.z/flat,0,-velocity.x/flat}:(Vec){1,0,0};
-    if(f.z>12){
+    int near=visibility(f.z,10,14);
+    if(near<COVER_STEPS){
+        detailCover=(Coverage){near,COVER_STEPS};
         /* Most schooling fish occupy only a few samples. Project the tangent
            into the image plane so the nose keeps leading as the camera turns. */
         Screen mid=project(f);
@@ -957,8 +1029,10 @@ static void draw_fish(Vec center,Vec velocity){
         triangle(nose,upper,lower,tone);triangle(rear,lower,upper,tone);
         Screen a={mid.x-.64f*vx,mid.y-.64f*vy-half,mid.iz};
         Screen b={a.x,a.y+2*half,mid.iz};triangle(rear,a,b,tone);
-        return;
+        detailCover=opaque;
+        if(!near)return;
     }
+    detailCover=(Coverage){0,near};
     Vec up={forward.y*side.z,forward.z*side.x-forward.x*side.z,-forward.y*side.x};
     Vec nose={center.x+.40f*forward.x,center.y+.40f*forward.y,center.z+.40f*forward.z};
     Vec rear={center.x-.30f*forward.x,center.y-.30f*forward.y,center.z-.30f*forward.z};
@@ -977,6 +1051,7 @@ static void draw_fish(Vec center,Vec velocity){
     Vec top={fin.x+.17f*up.x,fin.y+.17f*up.y,fin.z+.17f*up.z};
     Vec bottom={fin.x-.17f*up.x,fin.y-.17f*up.y,fin.z-.17f*up.z};
     face(rear,top,bottom,41);
+    detailCover=opaque;
 }
 /* Local coordinates on a swimming turtle: right, height and forward. */
 static Vec turtle_point(Vec p,float x,float y,float z,float sineYaw,float cosineYaw){
@@ -992,13 +1067,18 @@ static void turtle(Vec p,float yaw,float beat){
         rim[j]=turtle_point(p,rimX[j],0,rimZ[j],s,c);
         plate[j]=turtle_point(p,rimX[j]*.55f,.34f,rimZ[j]*.56f,s,c);
     }
-    int close=camera(p).z<12;
+    int near=visibility(camera(p).z,10,14);
     for(int j=0;j<8;j++){
         int k=(j+1)%8;
-        if(close){
+        if(near){
+            detailCover=(Coverage){0,near};
             quad(rim[j],rim[k],plate[k],plate[j],56+(j%3)*10);
             face(plate[j],plate[k],top,88+(j%2)*10);
-        }else face(rim[j],rim[k],top,64+(j%3)*10);
+        }
+        if(near<COVER_STEPS){
+            detailCover=(Coverage){near,COVER_STEPS};face(rim[j],rim[k],top,64+(j%3)*10);
+        }
+        detailCover=opaque;
         if(view->p.y<p.y+.2f)face(rim[k],rim[j],belly,107);
     }
     /* Broad front flippers hinge at the shoulder; short rear paddles steer. */
@@ -1036,10 +1116,12 @@ static void raster_jelly(Sprite s,float phase){
         float t=(s.y-y)/h,span=r*sqrtf(fmaxf(0,1-t*t));
         stroke(y,max2(0,(int)ceilf(s.x-span)),min2(LCD_W,(int)ceilf(s.x+span)),y==base?rim:crown);
     }
-    int strands=r>6?5:3;float length=s.scale*1.4f;
-    int end=min2(LCD_H,(int)(s.y+length));
-    for(int j=0;j<strands;j++){
-        float x=s.x+(j/(float)(strands-1)-.5f)*r*1.45f;
+    for(int j=0;j<5;j++){
+        float length=s.scale*1.4f;
+        if(j&1)length*=clampf((r-5)*.25f,0,1);
+        if(length<1)continue;
+        int end=min2(LCD_H,(int)(s.y+length));
+        float x=s.x+(j*.25f-.5f)*r*1.45f;
         float bend=motion_sin(phase+j*1.1f)*s.scale*.24f;
         for(int y=max2(0,base+1);y<end;y++){
             float t=(y-s.y)/length;
@@ -1158,8 +1240,10 @@ static void squid(Swimmer s,float pulse){
     if(eye.z>1 && eye.z<22){
         Screen v=project(eye);
         Sprite disc={v.x,v.y,220.f*s.scale/eye.z,v.iz,eye.z};
+        detailCover.high=visibility(eye.z,16,22);
         oval(disc,0,0,.13f,.125f,179);
         oval(disc,0,0,.074f,.072f,38);
+        detailCover=opaque;
     }
     for(int j=-1;j<=1;j++){
         Vec root=body_point(s,.12f*j,.07f,-.31f);
@@ -1301,9 +1385,12 @@ void render(const Diver *d,uint8_t *frame,int stride){
         Camera p=camera((Vec){arches[i].x,arches[i].y,arches[i].z});
         if(p.z>-18 && p.z<TERRAIN_RANGE+18 && fabsf(p.x)<p.z+36)draw_model(&landmarks[2+i]);
     }
+    rangeCover=reefCover;
     draw_plants();animals();reef_life();encounters_at_reef();marine_snow();
+    rangeCover=landmarkCover;
     for(int b=0;b<BUCKETS;b++)for(int id=bucketHead[b];id>=0;id=commands[id].next){
         const Command *cmd=&commands[id];
+        drawCover=cmd->coverage;
         switch(cmd->type){
         case TRI_CMD:raster_triangle(cmd->v[0],cmd->v[1],cmd->v[2],cmd->tone);break;
         case OVAL_CMD:raster_oval(cmd->oval.s,cmd->oval.x,cmd->oval.y,cmd->oval.rx,cmd->oval.ry,cmd->tone);break;
@@ -1313,4 +1400,5 @@ void render(const Diver *d,uint8_t *frame,int stride){
         case SNOW_CMD:flat_span(cmd->snow.y,cmd->snow.x,cmd->snow.x+1,cmd->snow.key,cmd->tone);break;
         }
     }
+    drawCover=opaque;
 }
