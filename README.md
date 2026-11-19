@@ -4,7 +4,7 @@
 
 A one-bit diving demo for **Playdate**, written in C. The tour opens on a sunken ship. Follow the camera through six dive sites, or press **A** mid-flight and swim straight into the scene.
 
-**[Download Brineglass v0.5.5](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.5.5/Brineglass-0.5.5.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
+**[Download Brineglass v0.6.0](https://github.com/meshchaninov/brineglass-playdate/releases/download/v0.6.0/Brineglass-0.6.0.pdx.zip)** · [Русский](README.ru.md) · [Watch the tour preview](docs/media/tour.gif)
 
 ## From the LCD
 
@@ -31,17 +31,17 @@ On the map, choose a site with up / down and confirm with A. The system menu let
 
 ## Inside the renderer
 
-The console computes the camera, depth, water lighting and animals every frame. The seabed uses a heightfield marched from near to far. Kelp bends in the current. A build-time C tool grows branching corals, traces their surfaces from multiple directions and stores tone and depth so rocks can hide individual branches at runtime.
+Brineglass draws each frame directly into the **400 × 240** one-bit framebuffer. The seabed advances from near to far. Each depth slice updates a horizon for every LCD column, so the next slice only fills newly visible rock. The same horizons clip kelp, coral branches and fish against the terrain. The Cortex-M7 compares four column heights per instruction using unsigned byte arithmetic.
 
-Water and terrain use a 100 × 60 grid. The foreground adapts between 100 × 60, 134 × 80 and 200 × 120. A final dithering pass reconstructs the 400 × 240 LCD image. The renderer can skip groups of landmark faces outside the view or behind terrain before projecting their vertices.
+The water projection samples wave and shaft intensities at the corners of 8 × 4 light patches. It interpolates the light across native scanlines and dithers eight LCD pixels into one byte. Triangle edges use fixed-point arithmetic. Sprites and facets are drawn from far to near, and the coral atlas skips transparent texels. The tour and free swim share this renderer.
 
-| v0.5.4 on physical Playdate, sound enabled | Result |
+| Physical Playdate, v0.6.0, sound enabled | Result |
 | --- | ---: |
-| Complete six-site tour | 2,909 frames in 95.983 s · **30.31 FPS** |
-| Shipwreck / whale fluke flybys | 30.35 / 30.29 FPS |
-| Frames with render, UI and audio work over 33 ms | 7 of 2,909 |
+| Complete six-site tour | 2,910 frames in 95.999 s · **30.31 FPS** |
+| Longest update, including controls, overlays and audio | 25 ms |
+| Updates over 33 ms | 0 |
 
-These measurements come from one complete tour on firmware 3.1.2. The [renderer notes](docs/rendering.ru.md) include per-site resolutions, timings and comparison frames.
+[Timings for each site](docs/rendering.ru.md) · [Same camera in v0.5.5 and v0.6.0](docs/media/native-comparison.png)
 
 ## Build from source
 

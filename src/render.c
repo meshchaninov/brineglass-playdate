@@ -6,55 +6,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The light buffer is linear monochrome. Only the final pass converts it to LCD bits. */
-enum { LCD_W=WIDTH*2, LCD_H=HEIGHT*2 };
-static uint8_t light[HEIGHT][WIDTH], wave[256];
-static uint8_t openWater[HEIGHT/2][WIDTH/2];
-/* Each terrain ray owns two background columns. Keep one depth and one
-   tone per ray until the foreground grid is initialized. */
-static uint16_t groundDepth[HEIGHT][WIDTH/2];
-static uint8_t groundLight[HEIGHT][WIDTH/2],waterTile[HEIGHT/2][WIDTH/2];
-typedef struct {uint8_t lane[WIDTH],row[HEIGHT],waterX[WIDTH/2],waterY[HEIGHT/2];} GridMap;
-static GridMap gridMaps[3];
-/* Only small, distant life fades into the opaque surface behind it. */
-static int smallPass;
-static uint8_t bedLight[HEIGHT][WIDTH];
-enum { CLEAR_RANGE=12, REEF_RANGE=40, TERRAIN_RANGE=78, FOG_BINS=512 };
-typedef struct {uint16_t water,reef;} Attenuation;
-static Attenuation attenuation[FOG_BINS];
+/* Projection is expressed in the original camera's 200-unit film plane.
+   Coverage, depth and the one-bit output all use native LCD coordinates. */
+enum { LCD_W=400, LCD_H=240, CLEAR_RANGE=12, REEF_RANGE=37, TERRAIN_RANGE=74 };
+static const int viewWidth=LCD_W,viewHeight=LCD_H,focal=110;
+static const float meshScale=2;
 
-
-static int detailLevel=DETAIL_FULL,viewWidth=WIDTH,viewHeight=HEIGHT,pixelSize=2;
-static float meshScale=1;
-void set_render_detail(int detail){
-    detailLevel=detail;pixelSize=4-detail;
-    meshScale=2.f/pixelSize;
-    viewWidth=(LCD_W+pixelSize-1)/pixelSize;viewHeight=LCD_H/pixelSize;
-}
-static uint16_t depth[HEIGHT][WIDTH];
-static const int focal=110;
+static uint8_t wave[256],ink[256][4],waterRow[LCD_H];
+static uint8_t *lcd;
+static int pitchBytes,tick,baking;
 static const Diver *view;
 static float headingX,headingZ,horizon;
-static int tick;
-
 static float clampf(float v,float lo,float hi){return fminf(hi,fmaxf(lo,v));}
 static int min2(int a,int b){return a<b?a:b;}
 static int max2(int a,int b){return a>b?a:b;}
 static int sine(int i){return wave[(unsigned)i&255];}
-/* One LCD stamp per source sample. Tone and both local slopes select a
-   dithered plane. Each byte of the stamp is a separate LCD scanline. */
-enum { SLOPES=9, RAMPS=32*SLOPES*SLOPES, PHASES=4+16+1 };
-static const int gradient[SLOPES]={-112,-72,-40,-16,0,16,40,72,112};
-static uint32_t stamps[PHASES*RAMPS];
-static uint16_t slopeX[511],slopeY[511];
-static uint8_t whiteThreshold[4][4];
-/* Sort stamps by gradient, then tone and horizontal Bayer phase. Adjacent
-   tones and their alternating pixel patterns now share cache lines. */
-static int stamp_band(int size,int y){
-    if(size==4)return 20*RAMPS;
-    if(size==3)return (4+4*(y&3))*RAMPS;
-    return 2*(y&1)*RAMPS;
-}
 /* Linear interpolation keeps the phase continuous for moving animals. */
 enum { TRIG_STEPS=1024 };
 static float motionTable[TRIG_STEPS+1];
@@ -66,116 +32,44 @@ static inline float motion_wave(float index){
 }
 static inline float motion_sin(float angle){return motion_wave(angle*(TRIG_STEPS/6.283185307f));}
 static inline float motion_cos(float angle){return motion_wave(angle*(TRIG_STEPS/6.283185307f)+TRIG_STEPS/4);}
+static uint8_t seaTile[64][64];
+/* Eight native samples of a linear light ramp at the LCD's Bayer phase. */
+enum { RAMP_RADIUS=12 };
+static uint8_t rampInk[2*RAMP_RADIUS+1][256][4];
 static void init_tables(void){
+    static const uint8_t bayer[4][4]={{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
     for(int i=0;i<TRIG_STEPS;i++)motionTable[i]=sinf(i*(6.283185307f/TRIG_STEPS));
     motionTable[TRIG_STEPS]=motionTable[0];
-    static const int bayer[4][4]={{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
-    int ink[256];
     for(int i=0;i<256;i++){
         wave[i]=(uint8_t)(127.5f+127.5f*sinf(i*.02454369f));
         float t=clampf((i-26)/208.f,0,1);
-        ink[i]=(int)(255*t*t*(3-2*t));
+        int level=(int)(255*t*t*(3-2*t));
+        for(int y=0;y<4;y++)for(int x=0;x<8;x++)
+            if(level>16*bayer[y][x&3]+7)ink[i][y]|=128u>>x;
     }
-    for(int y=0;y<4;y++)for(int x=0;x<4;x++){
-        int tone=0;while(ink[tone]<=16*bayer[y][x]+7)tone++;
-        whiteThreshold[y][x]=(uint8_t)tone;
-    }
-    for(int d=-255;d<=255;d++){
-        int nearest=0;
-        for(int k=1;k<SLOPES;k++)
-            if(abs(d-2*gradient[k])<abs(d-2*gradient[nearest]))nearest=k;
-        slopeX[d+255]=(uint16_t)(nearest*SLOPES*32);
-        slopeY[d+255]=(uint16_t)(nearest*32);
-    }
-    for(int size=2;size<=4;size++){
-        int phases=size==4?1:size==2?2:4;
-        for(int y=0;y<phases;y++)for(int x=0;x<phases;x++){
-            uint32_t *table=stamps+stamp_band(size,y)+x;
-            for(int tone=0;tone<32;tone++)for(int gx=0;gx<SLOPES;gx++)for(int gy=0;gy<SLOPES;gy++){
-                uint32_t block=0;
-                for(int b=0;b<size;b++)for(int a=0;a<size;a++){
-                    int delta=gradient[gx]*(2*a+1-size)+gradient[gy]*(2*b+1-size);
-                    int value=tone*8+4+delta/(2*size);
-                    if(value>=whiteThreshold[(y*size+b)&3][(x*size+a)&3])
-                        block|=1u<<(8*b+size-1-a);
-                }
-                table[((gx*SLOPES+gy)*32+tone)*phases]=block;
-            }
+    for(int g=-RAMP_RADIUS;g<=RAMP_RADIUS;g++)for(int tone=0;tone<256;tone++)
+        for(int y=0;y<4;y++)for(int x=0;x<8;x++){
+            int value=min2(255,max2(0,tone+((2*x-7)*g)/4));
+            rampInk[g+RAMP_RADIUS][tone][y]|=ink[value][y]&(128u>>x);
         }
-    }
-}
-/* All positions are evaluated from the current camera. The one repeating tile
-   stores wave intensity, and the depth slices store camera-independent distances. */
-enum { MAX_SLICES=90 };
-typedef struct {float z,inv; int key,haze;} Slice;
-static Slice slices[3][MAX_SLICES];
-static int sliceCount[3];
-static uint8_t seaTile[64][64];
-/* Bilinear patch coefficients in quarter metres, sampled continuously as a
-   ray crosses a two-metre terrain cell. The material uses its own metre grid. */
-typedef struct {int16_t base,dx,dz,twist;} HeightPatch;
-static HeightPatch field[GRID-1][GRID-1];
-static int8_t strata[64][64];
-static void prepare_field(void){
-    for(int z=0;z<GRID-1;z++)for(int x=0;x<GRID-1;x++){
-        int a=seabed[z][x],b=seabed[z][x+1],c=seabed[z+1][x],d=seabed[z+1][x+1];
-        field[z][x]=(HeightPatch){a,b-a,c-a,a-b-c+d};
-    }
-    for(int y=0;y<64;y++)for(int x=0;x<64;x++){
-        int n=stone_sample(x*128,y*150,x*73+y*13);
-        strata[y][x]=(int8_t)(n*.63f+(sine(y*19+sine(x*4)/8)-127)*.06f);
-    }
-}
-static int fade_weight(float z,float start,float end){
-    float t=clampf((z-start)/(end-start),0,1);
-    return (int)(256*t*t*(3-2*t)+.5f);
-}
-static void prepare_environment(void){
-    for(int q=0;q<3;q++){
-        GridMap *m=&gridMaps[q];
-        int dst=4-q,src=4;
-        int lanes=((LCD_W+src-1)/src)/2,rows=LCD_H/src;
-        for(int x=0;x<(LCD_W+dst-1)/dst;x++){
-            int col=(2*x+1)*dst/(2*src);
-            m->lane[x]=min2(lanes-1,col/2);
-            if(x<(LCD_W+dst-1)/dst/2)m->waterX[x]=min2(lanes-1,col);
-        }
-        for(int y=0;y<LCD_H/dst;y++){
-            int row=(2*y+1)*dst/(2*src);
-            m->row[y]=min2(rows-1,row);
-            if(y<LCD_H/dst/2)m->waterY[y]=min2(rows/2-1,row);
-        }
-    }
-    for(int i=0;i<FOG_BINS;i++){
-        float z=32760.f/(i*8+4);
-        attenuation[i]=(Attenuation){fade_weight(z,CLEAR_RANGE,TERRAIN_RANGE-2),
-                                     fade_weight(z,REEF_RANGE-10,REEF_RANGE-1)};
-    }
     for(int z=0;z<64;z++)for(int x=0;x<64;x++){
         int a=sine(x*4+sine(z*4)/6),b=sine(z*4+a/4);
         seaTile[z][x]=(uint8_t)(a/4+b/7+max2(0,35-abs(a-b))*2);
     }
-    for(int q=0;q<3;q++){
-        for(float z=1.2f;sliceCount[q]<MAX_SLICES;){
-            z=fminf(z,TERRAIN_RANGE);
-            Slice *s=&slices[q][sliceCount[q]++];
-            s->z=z;s->inv=focal/z;s->key=(int)(32760/z);s->haze=fade_weight(z,CLEAR_RANGE,TERRAIN_RANGE-2);
-            if(z>=TERRAIN_RANGE)break;
-            float step=.55f+(2-q)*.22f+z*(.054f+(2-q)*.012f);
-            z+=step+fmaxf(0,(z-30)*.10f);
-        }
-    }
 }
+/* Project the waves at the corners of an 8 by 4 patch. Interpolate the
+   light on each LCD row and threshold each of its eight native pixels. */
 static void water(void){
     int phase=(int)(view->time*16),angle=(int)(view->yaw*108);
-    int shafts[WIDTH+96];
-    for(int i=0;i<WIDTH+96;i++){
-        int a=i+angle;
-        int group=sine(a*2+phase/6)+sine(a*4-phase/8);
+    int shafts[276];
+    for(int i=0;i<276;i++){
+        int a=i+angle,group=sine(a*2+phase/6)+sine(a*4-phase/8);
         shafts[i]=(group*group/4000)*(80+sine(5*a+phase/5))/340;
     }
-    for(int y=0;y<viewHeight;y+=2){
-        int sceneY=(int)(y/meshScale);
+    uint8_t corners[2][LCD_W/8+1];
+    for(int y=0;y<=LCD_H;y+=4){
+        uint8_t *cur=corners[(y/4)&1];
+        int sceneY=y/2;
         float elevation=(horizon-sceneY)/focal;
         int ambient=161+(int)(44*clampf(elevation+.35f,-.8f,1.5f)+view->p.y*.28f);
         float dist=-view->p.y/fmaxf(.05f,elevation),step=dist/focal;
@@ -183,89 +77,148 @@ static void water(void){
         float wx=view->p.x+dist*headingX-100*step*headingZ;
         float wz=view->p.z+dist*headingZ+100*step*headingX;
         int u=(int)((wx*3.3f+wz*6.2f)*64)+phase*64,v=(int)((wz*9.7f-wx*2.5f)*64)-phase*64;
-        int du=(int)((headingZ*3.3f-headingX*6.2f)*step*128/meshScale);
-        int dv=(int)((-headingX*9.7f-headingZ*2.5f)*step*128/meshScale);
-        unsigned shift=(HEIGHT-1-sceneY)*3/5;
-        for(int x=0;x<viewWidth;x+=2,u+=du,v+=dv){
-            int shaft=(shafts[x*pixelSize/2+shift]*(176-sceneY))>>7;
+        int du=(int)((headingZ*3.3f-headingX*6.2f)*step*256);
+        int dv=(int)((-headingX*9.7f-headingZ*2.5f)*step*256);
+        int shift=(119-sceneY)*3/5;
+        if(y<LCD_H)memset(waterRow+y,ambient,4);
+        for(int col=0;col<=LCD_W/8;col++,u+=du,v+=dv){
             int ripple=0;
             if(surf){
                 int broad=seaTile[(v>>8)&63][(u>>8)&63];
                 int cross=seaTile[((u>>9)-(phase>>1))&63][((v>>9)+(phase>>2))&63];
                 ripple=surf*(3*broad+cross-228)/384;
             }
-            int clearWater=ambient+shaft+ripple;
-            uint8_t value=(uint8_t)min2(255,clearWater+((176-clearWater)>>3));
-            waterTile[y/2][x/2]=value;
+            int base=ambient+ripple, gain=176-sceneY;
+            int a=min2(255,base+((shafts[4*col+shift]*gain)>>7));
+            cur[col]=a+((176-a)>>3);
         }
-        int lanes=viewWidth/2;
-        memcpy(groundLight[y],waterTile[y/2],lanes);
-        memcpy(groundLight[y+1],waterTile[y/2],lanes);
-        memset(groundDepth[y],0,lanes*sizeof(uint16_t));
-        memset(groundDepth[y+1],0,lanes*sizeof(uint16_t));
+        if(!y)continue;
+        const uint8_t *prev=corners[((y/4)&1)^1];
+        for(int col=0;col<LCD_W/8;col++){
+            int l=prev[col],r=prev[col+1];
+            int grad=min2(RAMP_RADIUS,max2(-RAMP_RADIUS,((r-l)+(cur[col+1]-cur[col]))/8));
+            int tone=(l+r)*4;
+            int dy=cur[col]+cur[col+1]-l-r;
+            const uint8_t (*ramp)[4]=rampInk[grad+RAMP_RADIUS];
+            uint8_t *out=lcd+(y-4)*pitchBytes+col;
+            for(int j=0;j<4;j++,tone+=dy)out[j*pitchBytes]=ramp[(tone+(dy/2)+4)>>3][j];
+        }
     }
 }
+enum { RINGS=32, BAND=8, BANDS=LCD_W/BAND };
+typedef struct {float z,inv; int key,fog;} Ring;
+static Ring rings[RINGS];
+static int ringCount;
+static uint8_t roof[RINGS+1][LCD_W],roofMin[RINGS+1][BANDS],roofMax[RINGS+1][BANDS];
+static uint8_t ringForKey[4096],fogForKey[4096];
+static int8_t strata[64][64];
+typedef struct {int16_t y,tone,phase,rock;} Knot;
+static Knot knots[RINGS][BANDS+1];
 
-typedef struct {float y;int slice,firstRow,shade;} Crest;
-static Crest crest[WIDTH/2];
-static float continuous_height(int gx,int gz){
-    const HeightPatch *m=&field[gz>>11][gx>>11];
-    int fx=(gx>>3)&255,fz=(gz>>3)&255;
-    int height=m->base*256+m->dx*fx+m->dz*fz+((m->twist*fx*fz)>>8);
-    return height*(1.f/1024);
-}
-static void bottom(void){
-    int top[WIDTH];
-    float previousY[WIDTH];
-    for(int x=0;x<WIDTH;x++){top[x]=viewHeight;previousY[x]=viewHeight;}
-    for(int i=0;i<viewWidth/2;i++)crest[i]=(Crest){viewHeight,-1,viewHeight,0};
-    const int stepX=2;
-    int previousKey=0;
-    for(int k=0;k<sliceCount[detailLevel];k++){
-        const Slice *s=&slices[detailLevel][k];
-        float step=s->z/focal;
-        float start=(.5f*stepX/meshScale-100)*step;
-        int gx=(int)((view->p.x+EXTENT+s->z*headingX+start*headingZ)*1024);
-        int gz=(int)((view->p.z+EXTENT+s->z*headingZ-start*headingX)*1024);
-        int dx=(int)(step*stepX/meshScale*headingZ*1024),dz=(int)(-step*stepX/meshScale*headingX*1024);
-        for(int x=0;x<viewWidth;x+=stepX,gx+=dx,gz+=dz){
-            if(!top[x] || (unsigned)gx>=2u*(GRID-1)*1024 || (unsigned)gz>=2u*(GRID-1)*1024)continue;
-            float h=continuous_height(gx,gz);
-            float screen=(horizon+(view->p.y-h)*s->inv)*meshScale;
-            if(screen<crest[x/2].y){crest[x/2].y=screen;crest[x/2].slice=k;}
-            float prev=previousY[x];previousY[x]=screen;
-            int y=max2(0,(int)ceilf(screen));
-            if(y>=top[x])continue;
-            int ix=gx>>10,iz=gz>>10,tx=(gx>>6)&15,tz=(gz>>6)&15;
-            const uint8_t *n=groundTone[iz]+ix,*south=n+GROUND_SAMPLES;
-            int a=n[0]*16+tx*(n[1]-n[0]),b=south[0]*16+tx*(south[1]-south[0]);
-            int tone=(a*16+(b-a)*tz)>>8;
-            int rock=(int)clampf((h+42)*20,0,180);
-            int caustic=seaTile[((gz>>8)-(tick>>2))&63][((gx>>8)+(tick>>2))&63];
-            int value=tone+(caustic>>3)+max2(0,caustic-100)/3-7;
-            int span=top[x]-y;
-            float slope=previousKey && prev>screen+.05f?(previousKey-s->key)/(prev-screen):0;
-            int dk=(int)(slope*256),key=(int)((s->key+(y-screen)*slope)*256);
-            int tu=((gx>>8)+(gz>>9))&63;
-            float dy=s->z/(focal*meshScale);
-            int tv=(int)((view->p.y+(horizon*meshScale-y)*dy)*1024)+(gz>>3);
-            int dv=(int)(dy*1024);
-            for(int row=y;row<y+span;row++,key+=dk,tv-=dv){
-                int relief=(rock*strata[(tv>>8)&63][tu])>>8;
-                uint8_t tone=(uint8_t)max2(12,min2(239,value+relief));
-                if(s->haze)tone+=(int)((waterTile[row/2][x/2]-tone)*s->haze)>>8;
-                uint16_t hit=(uint16_t)(key>>8);
-                groundLight[row][x/2]=tone;
-                groundDepth[row][x/2]=hit;
-            }
-            top[x]=y;
-        }
-        previousKey=s->key;
+static void terrain_tables(void){
+    for(float z=1.2f;ringCount<RINGS;){
+        z=fminf(z,TERRAIN_RANGE);
+        rings[ringCount++]=(Ring){z,220.f/z,(int)(32760/z),(int)(clampf((z-12)/62,0,1)*230)};
+        if(z>=TERRAIN_RANGE)break;
+        z+=1.0f+z*.105f;
     }
-    for(int i=0;i<viewWidth/2;i++){
-        int row=top[2*i];
-        crest[i].firstRow=row;
-        if(row<viewHeight)crest[i].shade=groundLight[min2(viewHeight-1,row+1)][i];
+    for(int i=0;i<4096;i++){
+        int key=i*8+4,k=0;
+        while(k<ringCount && rings[k].key>key)k++;
+        ringForKey[i]=k;
+        float t=clampf((32760.f/key-CLEAR_RANGE)/(TERRAIN_RANGE-CLEAR_RANGE),0,1);
+        fogForKey[i]=(uint8_t)(248*t*t*(3-2*t));
+    }
+    memset(roof[0],LCD_H,LCD_W);memset(roofMin[0],LCD_H,BANDS);memset(roofMax[0],LCD_H,BANDS);
+    for(int z=0;z<64;z++)for(int x=0;x<64;x++)
+        strata[z][x]=(int8_t)(stone_sample(x*128,z*150,x*73+z*13)*.63f+(sine(z*19+sine(x*4)/8)-127)*.06f);
+}
+static void terrain_knots(void){
+    for(int k=0;k<ringCount;k++){
+        Ring s=rings[k];
+        float dx=s.z*(BAND/220.f)*headingZ,dz=-s.z*(BAND/220.f)*headingX;
+        float wx=view->p.x+s.z*headingX-dx*(BANDS*.5f);
+        float wz=view->p.z+s.z*headingZ-dz*(BANDS*.5f);
+        int gx=(int)((wx+EXTENT)*1024),gz=(int)((wz+EXTENT)*1024);
+        int stepX=(int)(dx*1024),stepZ=(int)(dz*1024);
+        for(int i=0;i<=BANDS;i++,gx+=stepX,gz+=stepZ){
+            Knot *n=&knots[k][i];
+            if((unsigned)gx>=(GRID-1)*2048u || (unsigned)gz>=(GRID-1)*2048u){
+                *n=(Knot){LCD_H*4,160,0,0};continue;
+            }
+            int ix=gx>>11,iz=gz>>11,fx=(gx>>3)&255,fz=(gz>>3)&255;
+            const int16_t *a=&seabed[iz][ix],*b=a+GRID;
+            int h0=a[0]*256+(a[1]-a[0])*fx,h1=b[0]*256+(b[1]-b[0])*fx;
+            float h=(h0+(((h1-h0)*fz)>>8))*(1.f/1024);
+            n->y=(int16_t)clampf((2*horizon+(view->p.y-h)*s.inv)*4,-8000,8000);
+            const uint8_t *p=&groundTone[gz>>10][gx>>10],*q=p+GROUND_SAMPLES;
+            int tx=(gx>>6)&15,tz=(gz>>6)&15;
+            int t0=p[0]*16+(p[1]-p[0])*tx,t1=q[0]*16+(q[1]-q[0])*tx;
+            int caustic=seaTile[((gz>>8)-(tick>>2))&63][((gx>>8)+(tick>>2))&63];
+            n->tone=(t0+(((t1-t0)*tz)>>4))/16+(caustic>>3)+max2(0,caustic-100)/3-7;
+            n->phase=((gx>>8)+(gz>>9))&63;
+            n->rock=(int)clampf((h+42)*18,0,170);
+        }
+    }
+}
+static inline uint8_t edge_bits(const uint8_t *edge,int y){
+#if defined(__ARM_FEATURE_DSP) && defined(__thumb__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    /* Compare four unsigned LCD column heights at once. SEL takes the
+       corresponding bit only when the height is at least y+1. */
+    uint32_t a,b,tmp,u,v,level=(y+1)*0x01010101u;
+    memcpy(&a,edge,4);memcpy(&b,edge+4,4);
+    __asm__("usub8 %0,%3,%5\n\tsel %1,%6,%8\n\tusub8 %0,%4,%5\n\tsel %2,%7,%8"
+            : "=&r"(tmp),"=&r"(u),"=&r"(v)
+            : "r"(a),"r"(b),"r"(level),"r"(0x10204080u),"r"(0x01020408u),"r"(0u) : "cc");
+    u|=v;u|=u>>16;return (uint8_t)(u|(u>>8));
+#else
+    unsigned bits=0;for(int i=0;i<8;i++)bits=(bits<<1)|(y<edge[i]);return bits;
+#endif
+}
+/* Each band advances away from the eye. Only the newly exposed part of
+   each slope is written. The previous horizon is also its foreground clip. */
+static void terrain(void){
+    terrain_knots();
+    for(int k=0;k<ringCount;k++){
+        int texRow[LCD_H/4];
+        float step=rings[k].z/220.f;
+        float height=(view->p.y+2*horizon*step)*4;
+        for(int y=0;y<LCD_H/4;y++,height-=16*step)texRow[y]=(int)height&63;
+        for(int band=0;band<BANDS;band++){
+            Knot l=knots[k][band],r=knots[k][band+1];
+            const uint8_t *previous=roof[k]+band*8;
+            uint8_t *top=roof[k+1]+band*8;
+            int low=roofMin[k][band],high=roofMax[k][band];
+            int nextLow=low,nextHigh=high;
+            if(min2(l.y,r.y)+2>=high*4){
+                memcpy(top,previous,8);
+            }else{
+                int ys=l.y*16+32+(r.y-l.y),dy=(r.y-l.y)*2;
+                nextLow=LCD_H;nextHigh=0;
+                for(int x=0;x<8;x++,ys+=dy){
+                    int edge=min2(previous[x],max2(0,ys>>6));
+                    top[x]=edge;
+                    nextLow=min2(nextLow,edge);nextHigh=max2(nextHigh,edge);
+                }
+                int base=(l.tone+r.tone)/2,rock=(l.rock+r.rock)/2,fog=rings[k].fog;
+                int phase=l.phase;
+                int gradient=min2(RAMP_RADIUS,max2(-RAMP_RADIUS,((r.tone-l.tone)*(256-fog))>>10));
+                const uint8_t (*ramp)[4]=rampInk[gradient+RAMP_RADIUS];
+                uint8_t *out=lcd+nextLow*pitchBytes+band;
+                for(int y=nextLow;y<high;){
+                    int end=min2(high,(y|3)+1);
+                    int tone=base+((strata[texRow[y/4]][phase]*rock)>>8);
+                    tone+=((waterRow[y]-tone)*fog)>>8;
+                    const uint8_t *pattern=ramp[min2(255,max2(0,tone))];
+                    for(;y<end;y++,out+=pitchBytes){
+                        unsigned mask=(y<low?255:edge_bits(previous,y));
+                        if(y<nextHigh)mask&=~edge_bits(top,y);
+                        *out^=(*out^pattern[y&3])&mask;
+                    }
+                }
+            }
+            roofMin[k+1][band]=nextLow;roofMax[k+1][band]=nextHigh;
+        }
     }
 }
 typedef struct {float x,y,z;} Camera;
@@ -278,19 +231,81 @@ static Screen project(Camera p){
     float inv=1/p.z;
     return (Screen){meshScale*(100+focal*p.x*inv),meshScale*(horizon-focal*p.y*inv),32760*inv};
 }
-static inline void paint_sample(int y,int x,int key,int tone){
-    if(key<32760/CLEAR_RANGE){
-        Attenuation f=attenuation[key>>3];
-        tone+=((openWater[y/2][x/2]-tone)*f.water)>>8;
-        if(smallPass && f.reef){
-            if(f.reef==256)return;
-            tone+=((bedLight[y][x]-tone)*f.reef)>>8;
-        }
-    }
-    depth[y][x]=(uint16_t)key;light[y][x]=(uint8_t)tone;
+
+
+/* Generated once from the same ribbon geometry used for the plant silhouette. */
+static uint8_t bakedLeaf[80][64],leafMask[80][64];
+typedef struct {int ring,clearUntil;const uint8_t *pattern;} Brush;
+static inline Brush brush(int key,int tone,int y){
+    int bin=min2(4095,max2(0,key)>>3);
+    tone+=((waterRow[min2(239,max2(0,y))]-tone)*fogForKey[bin])>>8;
+    return (Brush){ringForKey[bin],0,ink[tone]};
 }
-static void triangle(Screen a,Screen b,Screen c,int color){
-    /* Increment the inverse depth across each scanline; horizontal edges need no special division. */
+static void bound_brush(Brush *pen,int x0,int x1){
+    int limit=LCD_H;
+    const uint8_t *edge=roofMin[pen->ring];
+    for(int i=max2(0,x0)>>3;i<=min2(LCD_W-1,x1)>>3;i++)limit=min2(limit,edge[i]);
+    pen->clearUntil=limit;
+}
+static inline void stroke(int y,int left,int right,Brush pen){
+    if(left>=right)return;
+    unsigned pattern=pen.pattern[y&3],mask=255u>>(left&7);
+    int a=left>>3,b=(right-1)>>3;
+    unsigned last=(255u<<(7-((right-1)&7)))&255;
+    uint8_t *row=lcd+y*pitchBytes;
+    if(y<pen.clearUntil){
+        if(a==b){row[a]^=(row[a]^pattern)&(mask&last);return;}
+        row[a]^=(row[a]^pattern)&mask;
+        for(int i=a+1;i<b;i++)row[i]=pattern;
+        row[b]^=(row[b]^pattern)&last;
+        return;
+    }
+    const uint8_t *lo=roofMin[pen.ring],*hi=roofMax[pen.ring];
+    for(int i=a;i<=b;i++){
+        unsigned bits=mask;
+        if(i==b)bits&=last;
+        if(y<lo[i])row[i]^=(row[i]^pattern)&bits;
+        else if(y<hi[i]){
+            bits&=edge_bits(roof[pen.ring]+i*8,y);
+            row[i]^=(row[i]^pattern)&bits;
+        }
+        mask=255;
+    }
+}
+static inline void flat_span(int y,int left,int right,int key,int tone){
+    stroke(y,left,right,brush(key,tone,y));
+}
+typedef struct {float x,y,scale,iz,z;} Sprite;
+enum { TRI_CMD, OVAL_CMD, KELP_CMD, CORAL_CMD, SNOW_CMD, JELLY_CMD, BUCKETS=1024, MAX_COMMANDS=8192 };
+typedef struct {
+    int16_t next;
+    uint8_t type,tone;
+    union {
+        Screen v[3];
+        struct {Sprite s;float x,y,rx,ry;} oval;
+        struct {Sprite s;float h;int phase;} kelp;
+        struct {const Prop *p;Camera base;int variant;} coral;
+        struct {int x,y,key;} snow;
+        struct {Sprite s;float phase;} jelly;
+    };
+} Command;
+static Command commands[MAX_COMMANDS];
+static int16_t bucketHead[BUCKETS],bucketTail[BUCKETS];
+static int commandCount;
+static Command *submit(int type,float key,int tone){
+    if(commandCount==MAX_COMMANDS)return NULL;
+    /* Logarithmic inverse-depth buckets retain fine ordering close to the eye. */
+    uint32_t bits;memcpy(&bits,&key,sizeof bits);
+    int bin=min2(BUCKETS-1,max2(0,(int)(bits>>17)-(134<<6)));
+    int id=commandCount++;
+    Command *cmd=&commands[id];cmd->type=type;cmd->tone=tone;cmd->next=-1;
+    if(bucketHead[bin]<0)bucketHead[bin]=id;
+    else commands[bucketTail[bin]].next=id;
+    bucketTail[bin]=id;
+    return cmd;
+}
+static void raster_triangle(Screen a,Screen b,Screen c,int color){
+    /* Walk both edges in Q12, with the same top-left fill rule on shared seams. */
     if(b.y<a.y){Screen s=a;a=b;b=s;}
     if(c.y<a.y){Screen s=a;a=c;c=s;}
     if(c.y<b.y){Screen s=b;b=c;c=s;}
@@ -298,41 +313,45 @@ static void triangle(Screen a,Screen b,Screen c,int color){
     int first=max2(0,(int)ceilf(a.y)),last=min2(viewHeight,(int)ceilf(c.y));
     if(first>=last || (a.x<0 && b.x<0 && c.x<0) ||
        (a.x>=viewWidth && b.x>=viewWidth && c.x>=viewWidth))return;
-    float slope=(c.x-a.x)/(c.y-a.y);
-    float zSlope=(c.iz-a.iz)/(c.y-a.y);
-    float across=b.x-(a.x+(b.y-a.y)*slope);
-    float dz=fabsf(across)>.0001f?(b.iz-a.iz-(b.y-a.y)*zSlope)/across:0;
-    int dzFixed=(int)(clampf(dz,-524287.f,524287.f)*16);
+    float inv=1/(c.y-a.y);
+    float slope=(c.x-a.x)*inv;
+    int longStep=(int)clampf(slope*4096,-1e8f,1e8f);
+    Brush pen=brush((int)((a.iz+b.iz+c.iz)*(1.f/3)),color,(first+last)/2);
+    bound_brush(&pen,(int)fminf(a.x,fminf(b.x,c.x))-1,(int)fmaxf(a.x,fmaxf(b.x,c.x))+1);
     for(int half=0;half<2;half++){
         Screen p=half?b:a,q=half?c:b;
         int y0=max2(first,(int)ceilf(p.y)),y1=min2(last,(int)ceilf(q.y));
         if(y0>=y1)continue;
         float shortSlope=(q.x-p.x)/(q.y-p.y);
-        float x1=a.x+(y0-a.y)*slope,x2=p.x+(y0-p.y)*shortSlope;
-        float z=a.iz+(y0-a.y)*zSlope;
-        for(int y=y0;y<y1;y++,x1+=slope,x2+=shortSlope,z+=zSlope){
-            int left=max2(0,(int)ceilf(fminf(x1,x2)));
-            int right=min2(viewWidth,(int)ceilf(fmaxf(x1,x2)));
-            if(left>=right)continue;
-            int key=(int)(clampf(z+(left-x1)*dz,0,65535)*16);
-            for(int x=left;x<right;x++,key+=dzFixed){
-                int k=key>>4;
-                if(k>=depth[y][x])paint_sample(y,x,k,color);
-            }
+        int shortStep=(int)clampf(shortSlope*4096,-1e8f,1e8f);
+        int x1=(int)clampf((a.x+(y0-a.y)*slope)*4096,-1e8f,1e8f);
+        int x2=(int)clampf((p.x+(y0-p.y)*shortSlope)*4096,-1e8f,1e8f);
+        for(int y=y0;y<y1;y++,x1+=longStep,x2+=shortStep){
+            int left=max2(0,(min2(x1,x2)+4095)>>12);
+            int right=min2(LCD_W,(max2(x1,x2)+4095)>>12);
+            if(baking){
+                if(y<80)for(int x=left;x<min2(64,right);x++){bakedLeaf[y][x]=color;leafMask[y][x]=1;}
+            }else stroke(y,left,right,pen);
         }
     }
+}
+static void triangle(Screen a,Screen b,Screen c,int tone){
+    if(baking){raster_triangle(a,b,c,tone);return;}
+    if((a.x<0 && b.x<0 && c.x<0) || (a.x>=LCD_W && b.x>=LCD_W && c.x>=LCD_W))return;
+    if((a.y<0 && b.y<0 && c.y<0) || (a.y>=LCD_H && b.y>=LCD_H && c.y>=LCD_H))return;
+    Command *cmd=submit(TRI_CMD,(a.iz+b.iz+c.iz)*(1.f/3),tone);
+    if(cmd){cmd->v[0]=a;cmd->v[1]=b;cmd->v[2]=c;}
 }
 /* Static landmarks keep shared vertices in world coordinates. Projection is
    performed once per vertex for the current camera, including free swimming. */
 enum { MAX_MODEL_VERTS=512, MAX_MODEL_FACES=640 };
-typedef struct {uint16_t a,b,c,tone;} Facet;
+typedef struct {uint16_t a,b,c;uint8_t tone;int8_t winding;} Facet;
+static int winding;
 enum { GROUP_FACES=16, MAX_GROUPS=(MAX_MODEL_FACES+GROUP_FACES-1)/GROUP_FACES, VERT_WORDS=(MAX_MODEL_VERTS+31)/32 };
 typedef struct {Vec center,half;} ModelBounds;
 typedef struct {ModelBounds bounds;uint32_t vertices[VERT_WORDS];} FaceGroup;
 typedef struct {ModelBounds bounds;FaceGroup groups[MAX_GROUPS];int nverts,nfaces,overflow;Vec positions[MAX_MODEL_VERTS];Facet faces[MAX_MODEL_FACES];} Model;
 static Model landmarks[2+3],*building;
-typedef struct {Vec normal;float offset;} FacingPlane;
-static FacingPlane flukeInterior[MAX_MODEL_FACES];
 static int model_vertex(Vec v){
     for(int i=0;i<building->nverts;i++){
         Vec a=building->positions[i];
@@ -346,7 +365,7 @@ static void face(Vec a,Vec b,Vec c,int tone){
     if(building){
         if(building->nfaces>=MAX_MODEL_FACES){building->overflow=1;return;}
         Facet *f=&building->faces[building->nfaces++];
-        f->a=model_vertex(a);f->b=model_vertex(b);f->c=model_vertex(c);f->tone=tone;
+        f->a=model_vertex(a);f->b=model_vertex(b);f->c=model_vertex(c);f->tone=tone;f->winding=winding;
         return;
     }
     Camera v[3]={camera(a),camera(b),camera(c)},poly[4];
@@ -441,6 +460,7 @@ static void fluke(void){
     static const float ovalZ[]={0,.707f,1,.707f,0,-.707f,-1,-.707f};
     static const int stockTone[]={76,87,77,59,44,50,57,67};
     Vec last[8],ring[8];
+    winding=-1;
     for(unsigned i=0;i<sizeof stock/sizeof *stock;i++){
         const float *section=stock[i];
         float bend=fmaxf(0,1-section[0]/5.5f);
@@ -450,6 +470,7 @@ static void fluke(void){
             quad(last[j],last[(j+1)%8],ring[(j+1)%8],ring[j],stockTone[j]);
         memcpy(last,ring,sizeof ring);
     }
+    winding=0;
     for(int j=1;j<7;j++)face(ring[0],ring[j],ring[j+1],80);
     /* Cross sections follow the rounded leading edge and the thinner scalloped trailing
        edge. Both lobes share the centre section, which cuts a V into the trailing edge. */
@@ -462,40 +483,30 @@ static void fluke(void){
         {8.03f,9.72f,11.02f,-2.45f,.15f},{8.58f,10.61f,11.53f,-2.94f,.09f},
         {8.93f,11.44f,11.96f,-3.35f,.045f},{9.10f,12.29f,12.29f,-3.68f,0}
     };
-    static const float chord[]={0,.18f,.53f,.85f,1,.60f,.19f};
-    static const float bulge[]={0,.94f,.72f,.30f,0,-.54f,-.77f};
-    static const int bladeTone[]={43,65,87,64,46,38,42};
+    static const float chord[]={0,.28f,.75f,1,.50f};
+    static const float bulge[]={0,.94f,.55f,0,-.75f};
+    static const int bladeTone[]={43,68,87,46,40};
     for(int side=-1;side<=1;side+=2){
         for(unsigned i=0;i<sizeof sections/sizeof *sections;i++){
+            if(i==1 || i==3 || i==6 || i==9)continue;
+            winding=-side;
             const float *section=sections[i];
             float span=side*section[0],roll=.060f*span;
-            for(int j=0;j<7;j++){
+            for(int j=0;j<5;j++){
                 float height=section[1]+(section[2]-section[1])*chord[j]+roll;
                 float z=section[3]-.29f*(section[2]-section[1])*chord[j]+section[4]*bulge[j];
                 ring[j]=fluke_point(ground,span,height,z);
             }
-            if(i)for(int j=0;j<7;j++){
-                int start=building?building->nfaces:0;
-                quad(last[j],last[(j+1)%7],ring[(j+1)%7],ring[j],bladeTone[j]);
-                /* Only the broad inner blade has enough thickness to
-                   resolve front and back in the quantized depth buffer. */
-                if(building && i<=7 && (j==1 || j==2 || j==5)){
-                    for(int k=start;k<building->nfaces;k++){
-                        Facet f=building->faces[k];
-                        Vec a=building->positions[f.a],b=building->positions[f.b],c=building->positions[f.c];
-                        Vec u={b.x-a.x,b.y-a.y,b.z-a.z},v={c.x-a.x,c.y-a.y,c.z-a.z};
-                        Vec n={u.y*v.z-u.z*v.y,u.z*v.x-u.x*v.z,u.x*v.y-u.y*v.x};
-                        float scale=-side/fmaxf(.0001f,sqrtf(n.x*n.x+n.y*n.y+n.z*n.z));
-                        n=(Vec){n.x*scale,n.y*scale,n.z*scale};
-                        flukeInterior[k]=(FacingPlane){n,-(n.x*a.x+n.y*a.y+n.z*a.z)};
-                    }
-                }
+            if(i)for(int j=0;j<5;j++){
+                quad(last[j],last[(j+1)%5],ring[(j+1)%5],ring[j],bladeTone[j]);
             }
-            memcpy(last,ring,7*sizeof(Vec));
+            memcpy(last,ring,5*sizeof(Vec));
         }
     }
+    winding=0;
 }
 static void stone_arch(const Arch *a){
+    winding=-1;
     Vec previous[5],ring[5];
     float c=cosf(a->yaw),s=sinf(a->yaw);
     for(int i=0;i<=16;i++){
@@ -508,6 +519,7 @@ static void stone_arch(const Arch *a){
         if(i)for(int j=0;j<5;j++)quad(previous[j],previous[(j+1)%5],ring[(j+1)%5],ring[j],42+j*10+(int)(sa*12));
         memcpy(previous,ring,sizeof ring);
     }
+    winding=0;
 }
 static ModelBounds model_bounds(Model *m,int first,int end,uint32_t *mask){
     Vec low=m->positions[m->faces[first].a],high=low;
@@ -559,25 +571,6 @@ static int classify_bounds(const ModelBounds *box){
     if(hidden(x0,y0,x1,y1,(int)ceilf(32760/near)+2+(viewWidth+15)/16))return MODEL_HIDDEN;
     return x0>=0 && x1<viewWidth && y0>=0 && y1<viewHeight ? MODEL_INSIDE:MODEL_PARTIAL;
 }
-/* A plane rejected throughout this box of world-space camera positions stays rejected
-   as the diver moves within it. Rebuild only when the eye leaves the box. */
-static uint32_t *fluke_mask(const Model *m){
-    static Vec eye;
-    static uint32_t mask[MAX_GROUPS];
-    static int valid;
-    Vec e=view->p;
-    if(valid && fabsf(e.x-eye.x)<=1 && fabsf(e.y-eye.y)<=1 && fabsf(e.z-eye.z)<=1)return mask;
-    eye=e;valid=1;
-    Vec d={e.x-m->bounds.center.x,e.y-m->bounds.center.y,e.z-m->bounds.center.z};
-    float margin=-.5f*sqrtf(d.x*d.x+d.y*d.y+d.z*d.z)-3;
-    for(int i=0;i<m->nfaces;i++){
-        if(i%GROUP_FACES==0)mask[i/GROUP_FACES]=0;
-        FacingPlane p=flukeInterior[i];
-        if(e.x*p.normal.x+e.y*p.normal.y+e.z*p.normal.z+p.offset>=margin)
-            mask[i/GROUP_FACES]|=1u<<(i%GROUP_FACES);
-    }
-    return mask;
-}
 static void draw_model(const Model *model){
     if(model->overflow){
         int id=(int)(model-landmarks);
@@ -586,11 +579,6 @@ static void draw_model(const Model *model){
     }
     int visibility=classify_bounds(&model->bounds);
     if(visibility==MODEL_HIDDEN)return;
-    Camera center=camera(model->bounds.center);
-    int flukeOutside=model==&landmarks[1] && center.z>11 && center.z<48 &&
-                     (fabsf(view->p.x+5)>11 || fabsf(view->p.z+4)>8);
-    const uint32_t *facing=flukeOutside?fluke_mask(model):NULL;
-
     static Screen screen[MAX_MODEL_VERTS];
     static uint8_t clip[MAX_MODEL_VERTS];
     uint32_t needed[VERT_WORDS]={0};uint8_t skip[MAX_GROUPS];
@@ -618,30 +606,38 @@ static void draw_model(const Model *model){
     for(int j=0;j<groups;j++){
         if(skip[j])continue;
         int count=min2(GROUP_FACES,model->nfaces-j*GROUP_FACES);
-        uint32_t visible=facing?facing[j]:(1u<<count)-1u;
+        uint32_t visible=(1u<<count)-1u;
         for(;visible;visible&=visible-1){
             int i=j*GROUP_FACES+__builtin_ctz(visible);
             Facet f=model->faces[i];
             if(clip[f.a]&clip[f.b]&clip[f.c])continue;
             if((clip[f.a]|clip[f.b]|clip[f.c])&16)
                 face(model->positions[f.a],model->positions[f.b],model->positions[f.c],f.tone);
-            else triangle(screen[f.a],screen[f.b],screen[f.c],f.tone);
+            else{
+                Screen a=screen[f.a],b=screen[f.b],c=screen[f.c];
+                if(f.winding && f.winding*((b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x))<=0)continue;
+                triangle(a,b,c,f.tone);
+            }
         }
     }
 }
-typedef struct { float x,y,scale,iz,z; } Sprite;
+
 static Screen vertex(Sprite s,float x,float y){return (Screen){s.x+x*s.scale,s.y-y*s.scale,s.iz};}
-static void oval(Sprite s,float x,float y,float rx,float ry,int tone){
+static void raster_oval(Sprite s,float x,float y,float rx,float ry,int tone){
     Screen p=vertex(s,x,y);
     float w=fmaxf(.6f,rx*s.scale),h=fmaxf(.6f,ry*s.scale);
     int y0=max2(0,(int)ceilf(p.y-h)),y1=min2(viewHeight-1,(int)(p.y+h));
+    Brush pen=brush((int)s.iz,tone,(y0+y1)/2);
+    bound_brush(&pen,(int)(p.x-w)-1,(int)(p.x+w)+1);
     for(int row=y0;row<=y1;row++){
         float dy=(row-p.y)/h,extent=w*sqrtf(fmaxf(0,1-dy*dy));
         int left=max2(0,(int)ceilf(p.x-extent)),right=min2(viewWidth-1,(int)(p.x+extent));
-        for(int i=left;i<=right;i++)if(s.iz>=depth[row][i]){
-            paint_sample(row,i,(int)s.iz,tone);
-        }
+        stroke(row,left,right+1,pen);
     }
+}
+static void oval(Sprite s,float x,float y,float rx,float ry,int tone){
+    Command *cmd=submit(OVAL_CMD,s.iz,tone);
+    if(cmd){cmd->oval.s=s;cmd->oval.x=x;cmd->oval.y=y;cmd->oval.rx=rx;cmd->oval.ry=ry;}
 }
 /* Tapered ribbon with a twisted midrib. The current lifts the outer half of each leaf. */
 static void kelp_leaf(Sprite s,float x,float y,float dx,float dy,float curl,int dark,int lit){
@@ -699,7 +695,14 @@ static void sponge(const Prop *p){
         }
     }
 }
-static void draw_coral(const Prop *p,Camera base,int variant){
+static uint32_t coralMask[CORAL_FORMS][CORAL_TILTS][CORAL_ANGLES][CORAL_TEXELS][2];
+static void index_coral(void){
+    for(int form=0;form<CORAL_FORMS;form++)for(int tilt=0;tilt<CORAL_TILTS;tilt++)
+        for(int a=0;a<CORAL_ANGLES;a++)for(int y=0;y<CORAL_TEXELS;y++)
+            for(int x=0;x<CORAL_TEXELS;x++)if(coralAtlas[form][tilt][a][y][x])
+                coralMask[form][tilt][a][y][x/32]|=1u<<(x&31);
+}
+static void raster_coral(const Prop *p,Camera base,int variant){
     float size=p->size,dx=view->p.x-p->p.x,dz=view->p.z-p->p.z;
     float range=sqrtf(dx*dx+dz*dz),dy=view->p.y-p->p.y-.76f*size;
     float azimuth=atan2f(dx,dz)-p->phase;
@@ -711,20 +714,30 @@ static void draw_coral(const Prop *p,Camera base,int variant){
     float radius=size*meshScale*focal/base.z;
     float rx=radius*range/base.z,ry=radius*sqrtf(1+dy*dy/(range*range));
     float top=center.y-ry,left=center.x-rx;
-    float stepX=CORAL_TEXELS/(2*rx),stepY=CORAL_TEXELS/(2*ry);
+    float stepY=CORAL_TEXELS/(2*ry);
     int y0=max2(0,(int)ceilf(top-.5f)),y1=min2(viewHeight,(int)ceilf(center.y+ry-.5f));
-    int x0=max2(0,(int)ceilf(left-.5f)),x1=min2(viewWidth,(int)ceilf(center.x+rx-.5f));
+    if(y0>=y1 || rx<.25f || ry<.25f)return;
     float toward=size*base.z/(83.f*sqrtf(range*range+dy*dy));
+    int keys[32];
+    for(int i=0;i<32;i++){
+        float z=base.z-(8*i+4-128)*toward;
+        keys[i]=z>=1?(int)(32760.f/z):0;
+    }
+    const uint32_t (*mask)[2]=coralMask[variant%CORAL_FORMS][tilt][angle];
+    int xEdge[CORAL_TEXELS+1];uint32_t active[2]={0};
+    for(int x=0;x<=CORAL_TEXELS;x++){
+        xEdge[x]=min2(LCD_W,max2(0,(int)ceilf(left+x*(2*rx/CORAL_TEXELS)-.5f)));
+        if(x && xEdge[x]>xEdge[x-1])active[(x-1)/32]|=1u<<((x-1)&31);
+    }
     for(int y=y0;y<y1;y++){
-        const uint16_t *row=atlas[min2(CORAL_TEXELS-1,(int)((y+.5f-top)*stepY))];
-        for(int x=x0;x<x1;x++){
-            uint16_t sample=row[min2(CORAL_TEXELS-1,(int)((x+.5f-left)*stepX))];
-            if(!sample)continue;
-            float z=base.z-((sample&255)-128)*toward;
-            if(z<1)continue;
-            uint16_t key=(uint16_t)(32760.f/z);
-            if(key<depth[y][x])continue;
-            paint_sample(y,x,key,sample>>8);
+        int sy=min2(CORAL_TEXELS-1,(int)((y+.5f-top)*stepY));
+        for(int half=0;half<2;half++){
+            for(uint32_t bits=mask[sy][half]&active[half];bits;bits&=bits-1){
+                int x=32*half+__builtin_ctz(bits);
+                uint16_t sample=atlas[sy][x];
+                int key=keys[(sample&255)/8];
+                if(key)flat_span(y,xEdge[x],xEdge[x+1],key,sample>>8);
+            }
         }
     }
 }
@@ -739,7 +752,7 @@ static void build_canopy(void){
         int phase=variant*67,toneShift=variant*3,dark=41+toneShift,lit=95+toneShift;
         float h=12;
         Sprite s={32,79,6.3f,3000,10};
-        memset(depth,0,sizeof depth);
+        memset(leafMask,0,sizeof leafMask);
         float x=0,y=0;
         int count=8;
         for(int k=1;k<=count;k++){
@@ -759,33 +772,35 @@ static void build_canopy(void){
         for(int row=0;row<LEAF_H;row++){
             LeafRow *r=&canopy[variant][row];
             for(int x=0;x<LEAF_W;){
-                if(!depth[row][x]){x++;continue;}
-                int left=x,tone=light[row][x++];
-                while(x<LEAF_W && depth[row][x] && light[row][x]==tone)x++;
+                if(!leafMask[row][x]){x++;continue;}
+                int left=x,tone=bakedLeaf[row][x++];
+                while(x<LEAF_W && leafMask[row][x] && bakedLeaf[row][x]==tone)x++;
                 r->spans[r->n++]=(LeafSpan){left,x,tone};
             }
         }
     }
 }
-static void kelp_sprite(Sprite s,float h,int phase){
+static void raster_kelp(Sprite s,float h,int phase){
     float scale=s.scale*h/(6.3f*12),inv=1.f/scale;
     float top=s.y-79*scale,left=s.x-32*scale;
     int start=max2(0,(int)ceilf(top)),end=min2(viewHeight,(int)ceilf(s.y+scale));
     int variant=phase&3;
-    int darkest=41+variant*3,shine=95+variant*3;
+    Brush dark=brush((int)s.iz,41+variant*3,(start+end)/2);
+    Brush shine=brush((int)s.iz,95+variant*3,(start+end)/2);
+    bound_brush(&dark,(int)(left-6*scale),(int)(left+70*scale)+1);shine.clearUntil=dark.clearUntil;
+    int offsets[LEAF_W+1];
+    for(int i=0;i<=LEAF_W;i++)offsets[i]=(int)(scale*i*1024);
     float sway=scale*(sine(phase+tick*2)-127)*.040f;
     for(int y=start;y<end;y++){
         int row=min2(79,(int)((y-top)*inv));
         const LeafRow *r=&canopy[variant][row];
         float bend=(79-row)*(1.f/79),origin=left+sway*bend*bend;
+        int originFixed=(int)(origin*1024)+1023;
         for(int n=0;n<r->n;n++){
             LeafSpan span=r->spans[n];
-            int x0=max2(0,(int)ceilf(origin+span.left*scale));
-            int x1=min2(viewWidth,(int)ceilf(origin+span.right*scale));
-            int tone=span.tone<80?darkest:shine;
-            for(int x=x0;x<x1;x++)if(s.iz>=depth[y][x]){
-                paint_sample(y,x,(int)s.iz,tone);
-            }
+            int x0=max2(0,(originFixed+offsets[span.left])>>10);
+            int x1=min2(viewWidth,(originFixed+offsets[span.right])>>10);
+            stroke(y,x0,x1,span.tone<80?dark:shine);
         }
     }
 }
@@ -800,25 +815,11 @@ static void sponge_lod(Sprite s,float h){
         oval(s,cx+top*.13f,top,r*.61f,r*.20f,48);
     }
 }
-/* A tile stores the farthest opaque depth within it. Rejecting a prop
-   requires every tile intersecting its bounds to be in front of it. */
-enum { TILE=8, TILE_COLS=WIDTH/TILE, TILE_ROWS=HEIGHT/TILE };
-static uint16_t tileZ[TILE_ROWS][TILE_COLS];
-static void occlusion_tiles(void){
-    /* Front-to-back spans fill upwards. Depth is farthest at the top row of
-       each column, including zero in open water. Pairs share a ray. */
-    const GridMap *m=&gridMaps[detailLevel];
-    for(int y=0;y<viewHeight;y+=TILE)for(int x=0;x<viewWidth;x+=TILE){
-        const uint16_t *ground=groundDepth[m->row[y]];
-        int z=65535,last=m->lane[min2(viewWidth-1,x+TILE-1)];
-        for(int i=m->lane[x];i<=last;i++)z=min2(z,ground[i]);
-        tileZ[y/TILE][x/TILE]=(uint16_t)z;
-    }
-}
+/* The nearest depth of the bounding volume selects a conservative terrain horizon. */
 static int hidden(int x0,int y0,int x1,int y1,int key){
-    x0=max2(0,x0)/TILE;x1=min2(viewWidth-1,x1)/TILE;
-    y0=max2(0,y0)/TILE;y1=min2(viewHeight-1,y1)/TILE;
-    for(int y=y0;y<=y1;y++)for(int x=x0;x<=x1;x++)if(tileZ[y][x]<=key)return 0;
+    if(x1<0 || x0>=LCD_W || y1<0 || y0>=LCD_H)return 1;
+    const uint8_t *sky=roof[ringForKey[min2(4095,max2(0,key)>>3)]];
+    for(int x=max2(0,x0);x<=min2(LCD_W-1,x1);x++)if(y0<sky[x])return 0;
     return 1;
 }
 static void distant_rock(Sprite s,float h,int phase){
@@ -851,19 +852,19 @@ static void plant(const Prop *p){
     if(pos.y<0 || pos.y-(p->kind==CORAL?1.7f:1.f)*h*s.scale>meshScale*HEIGHT+2)return;
     switch(p->kind){
     case KELP:
-        if(c.z<(detailLevel==DETAIL_FULL?14:5) && detailLevel>DETAIL_LOW)outcrop(p->p,.45f+h*.026f,.45f+h*.024f,phase);
-        kelp_sprite(s,h,phase);
+        if(c.z<3)outcrop(p->p,.45f+h*.026f,.45f+h*.024f,phase);
+        {Command *cmd=submit(KELP_CMD,s.iz,0);if(cmd){cmd->kelp.s=s;cmd->kelp.h=h;cmd->kelp.phase=phase;}}
         break;
     case SPONGE:
-        if(c.z<(detailLevel==DETAIL_FULL?12:4) && detailLevel>DETAIL_LOW)sponge(p);
+        if(c.z<3)sponge(p);
         else sponge_lod(s,h);
         break;
     case CORAL:
-        if(c.z<(detailLevel==DETAIL_FULL?14:5) && detailLevel>DETAIL_LOW)outcrop(p->p,h*.48f,h*.28f,phase);
-        draw_coral(p,c,phase);
+        if(c.z<3)outcrop(p->p,h*.48f,h*.28f,phase);
+        {Command *cmd=submit(CORAL_CMD,s.iz,0);if(cmd){cmd->coral.p=p;cmd->coral.base=c;cmd->coral.variant=phase;}}
         break;
     case BOULDER:
-        if(c.z<(detailLevel==DETAIL_FULL?13:6) && detailLevel>DETAIL_LOW)outcrop(p->p,h*.90f,h*.65f,phase);
+        if(c.z<7)outcrop(p->p,h*.90f,h*.65f,phase);
         else distant_rock(s,h,phase);
         break;
     default:break;
@@ -874,6 +875,10 @@ static int16_t firstProp[CELL_COUNT][CELL_COUNT],nextProp[PROP_COUNT];
 static void index_props(void){
     memset(firstProp,0xff,sizeof firstProp);
     for(int i=0;i<PROP_COUNT;i++){
+        /* The tour has its own planted borders. Leave clear water between
+           wild clusters and keep large fronds from hiding the animals. */
+        if(i<WILD_PROPS && (i%3==1 || (props[i].kind==CORAL && i%3==2)))continue;
+        if(i>=WILD_PROPS && props[i].kind==CORAL && i%3==1)continue;
         const Vec p=props[i].p;
         int x=max2(0,min2(CELL_COUNT-1,(int)((p.x+EXTENT)/CELL_WIDTH)));
         int z=max2(0,min2(CELL_COUNT-1,(int)((p.z+EXTENT)/CELL_WIDTH)));
@@ -904,8 +909,9 @@ static void marine_snow(void){
         if(cam.z<1.6f || cam.z>15 || fabsf(cam.x)>cam.z)continue;
         Screen v=project(cam);
         int sx=(int)v.x,sy=(int)v.y;
-        if(sx>=0 && sx<meshScale*WIDTH && sy>=0 && sy<meshScale*HEIGHT && v.iz>depth[sy][sx]){
-            light[sy][sx]=(uint8_t)(182+(i%4)*12);
+        if(sx>=0 && sx<meshScale*WIDTH && sy>=0 && sy<meshScale*HEIGHT){
+            Command *cmd=submit(SNOW_CMD,v.iz,182+(i%4)*12);
+            if(cmd){cmd->snow.x=sx;cmd->snow.y=sy;cmd->snow.key=(int)v.iz;}
         }
     }
 }
@@ -970,10 +976,14 @@ static void turtle(Vec p,float yaw,float beat){
         rim[j]=turtle_point(p,rimX[j],0,rimZ[j],s,c);
         plate[j]=turtle_point(p,rimX[j]*.55f,.34f,rimZ[j]*.56f,s,c);
     }
+    int close=camera(p).z<12;
     for(int j=0;j<8;j++){
         int k=(j+1)%8;
-        quad(rim[j],rim[k],plate[k],plate[j],56+(j%3)*10);
-        face(plate[j],plate[k],top,88+(j%2)*10);face(rim[k],rim[j],belly,107);
+        if(close){
+            quad(rim[j],rim[k],plate[k],plate[j],56+(j%3)*10);
+            face(plate[j],plate[k],top,88+(j%2)*10);
+        }else face(rim[j],rim[k],top,64+(j%3)*10);
+        if(view->p.y<p.y+.2f)face(rim[k],rim[j],belly,107);
     }
     /* Broad front flippers hinge at the shoulder; short rear paddles steer. */
     for(int side=-1;side<=1;side+=2){
@@ -998,27 +1008,27 @@ static void jelly(Vec p,float phase,float size){
     if(cam.z<1.3f || cam.z>REEF_RANGE || fabsf(cam.x)>cam.z+2)return;
     Screen v=project(cam);
     Sprite sp={v.x,v.y,meshScale*focal/cam.z*size,v.iz,cam.z};
-    float pulse=motion_sin(phase),radius=.66f+.11f*pulse,height=.52f-.07f*pulse;
-    int fringe=91;
-    /* Open bell, with a lit crown and a dark scalloped underside. */
-    oval(sp,0,0,radius,.15f,fringe);
-    Screen crest=vertex(sp,0,height);
-    for(int i=0;i<8;i++){
-        float a=i*3.141593f/8,b=(i+1)*3.141593f/8;
-        Screen first=vertex(sp,radius*motion_cos(a),height*motion_sin(a));
-        Screen last=vertex(sp,radius*motion_cos(b),height*motion_sin(b));
-        triangle(vertex(sp,0,0),first,last,146+5*(i%3));
+    Command *cmd=submit(JELLY_CMD,v.iz,0);
+    if(cmd){cmd->jelly.s=sp;cmd->jelly.phase=phase;}
+}
+static void raster_jelly(Sprite s,float phase){
+    float pulse=motion_sin(phase),r=(.66f+.11f*pulse)*s.scale,h=(.52f-.07f*pulse)*s.scale;
+    if(r<.5f || h<.3f)return;
+    int base=(int)ceilf(s.y),y0=max2(0,(int)ceilf(s.y-h)),y1=min2(LCD_H,base+1);
+    Brush crown=brush((int)s.iz,163,base),rim=brush((int)s.iz,86,base);
+    for(int y=y0;y<y1;y++){
+        float t=(s.y-y)/h,span=r*sqrtf(fmaxf(0,1-t*t));
+        stroke(y,max2(0,(int)ceilf(s.x-span)),min2(LCD_W,(int)ceilf(s.x+span)),y==base?rim:crown);
     }
-    triangle(crest,vertex(sp,-radius*.40f,height*.76f),vertex(sp,0,height*.68f),195);
-    for(int i=0;i<5;i++){
-        float x=(i-2)*radius*.34f,y=0;
-        for(int j=1;j<=3;j++){
-            float nx=(i-2)*radius*.34f+.15f*motion_sin(phase-j*.9f+i*.7f)*j*.6f;
-            float ny=-j*(.40f+.06f*(i%2));
-            float w=fmaxf(.025f,.48f/sp.scale);
-            triangle(vertex(sp,x-w,y),vertex(sp,x+w,y),vertex(sp,nx+w,ny),fringe);
-            triangle(vertex(sp,x-w,y),vertex(sp,nx+w,ny),vertex(sp,nx-w,ny),fringe);
-            x=nx;y=ny;
+    int strands=r>6?5:3;float length=s.scale*1.4f;
+    int end=min2(LCD_H,(int)(s.y+length));
+    for(int j=0;j<strands;j++){
+        float x=s.x+(j/(float)(strands-1)-.5f)*r*1.45f;
+        float bend=motion_sin(phase+j*1.1f)*s.scale*.24f;
+        for(int y=max2(0,base+1);y<end;y++){
+            float t=(y-s.y)/length;
+            int px=(int)(x+bend*t*(3*t-1.5f));
+            stroke(y,max2(0,px),min2(LCD_W,px+1+(r>13)),rim);
         }
     }
 }
@@ -1092,196 +1102,22 @@ static void animals(void){
         }
     }
 }
+
 void prepare_renderer(void){
     static int ready;
     if(ready)return;
-    int quality=detailLevel;
-    set_render_detail(DETAIL_FULL);
-    init_tables();prepare_field();prepare_environment();build_canopy();build_landmarks();index_props();
-    set_render_detail(quality);ready=1;
-}
-/* The coarse march identifies the depth slice forming the skyline. Probe
-   the angular height again between slices along a new ray at a steep edge. */
-static float crest_probe(float u,int slice,int bgLevel){
-    float scale=2.f/(4-bgLevel);
-    int height=LCD_H/(4-bgLevel);
-    if(slice<0)return height;
-    const Slice *ring=slices[bgLevel];
-    int last=sliceCount[bgLevel]-1;
-    float center=ring[slice].z;
-    float z[3]={.5f*(ring[max2(0,slice-1)].z+center),center,.5f*(center+ring[min2(last,slice+1)].z)};
-    float dx=headingX+u*headingZ,dz=headingZ-u*headingX,best=height;
-    for(int i=0;i<3;i++){
-        int gx=(int)((view->p.x+EXTENT+dx*z[i])*1024),gz=(int)((view->p.z+EXTENT+dz*z[i])*1024);
-        if((unsigned)gx>=2u*(GRID-1)*1024 || (unsigned)gz>=2u*(GRID-1)*1024)continue;
-        float y=(horizon+(view->p.y-continuous_height(gx,gz))*focal/z[i])*scale;
-        best=fminf(best,y);
-    }
-    return best;
-}
-static void refine_skyline(uint8_t *frame,int stride,int bgLevel){
-    int bgPixel=4-bgLevel,bgHeight=LCD_H/bgPixel;
-    float bgScale=2.f/bgPixel;
-    int cols=((LCD_W+bgPixel-1)/bgPixel)/2;
-    for(int i=-1;i<cols;i++){
-        Crest l=crest[max2(0,i)],r=crest[min2(cols-1,i+1)];
-        if((l.slice<0 && r.slice<0) || (l.y< -2 && r.y< -2))continue;
-        float left=clampf(l.y,-bgHeight,bgHeight),right=clampf(r.y,-bgHeight,bgHeight);
-        float mid=.5f*(left+right);
-        if(i>=0 && i+1<cols && fabsf(left-right)>1){
-            float u=((2*i+2)/bgScale-100)/focal;
-            mid=crest_probe(u,l.slice,bgLevel);
-            if(l.slice!=r.slice)mid=fminf(mid,crest_probe(u,r.slice,bgLevel));
-            mid=clampf(mid,-bgHeight,bgHeight);
-        }
-        int start=(2*i+1)*bgPixel;
-        int last=min2(LCD_W,start+2*bgPixel);
-        for(int x=max2(0,start);x<last;x++){
-            int offset=x-start;
-            float t=((offset%bgPixel)+.5f)/bgPixel;
-            float a=offset<bgPixel?left:mid,b=offset<bgPixel?mid:right;
-            float edge=(a+(b-a)*t)*bgPixel;
-            int sx=x/pixelSize;
-            int lane=gridMaps[detailLevel].lane[sx];
-            Crest source=crest[lane];
-            float raw=source.firstRow*bgPixel;
-            if(fabsf(edge-raw)<.75f)continue;
-            int lo=max2(0,(int)floorf(fminf(edge,raw))-bgPixel);
-            int hi=min2(LCD_H,(int)ceilf(fmaxf(edge,raw))+bgPixel);
-            float invWidth=1/fmaxf(1,fabsf(b-a));
-            int leftTone=l.slice>=0?l.shade:r.shade,rightTone=r.slice>=0?r.shade:l.shade;
-            float mix=(offset+.5f)/(2*bgPixel);
-            int rim=(int)(leftTone+(rightTone-leftTone)*mix);
-            if(lo>=hi)continue;
-            int alpha=(int)((.5f+(lo+.5f-edge)*invWidth)*4096);
-            int advance=(int)(invWidth*4096+.5f);
-            int sxByte=x/8,bit=128>>(x&7),endCell=(hi-1)/pixelSize;
-            int nearest=l.slice<0?r.slice:r.slice<0?l.slice:min2(l.slice,r.slice);
-            int crestKey=nearest<0?0:slices[bgLevel][nearest].key;
-            for(int sy=lo/pixelSize,y=lo;sy<=endCell;sy++){
-                int end=min2(hi,(sy+1)*pixelSize);
-                int water=openWater[sy/2][sx/2];
-                int object=depth[sy][sx]!=groundDepth[gridMaps[detailLevel].row[sy]][lane];
-                /* A foreground animal or frond owns its original LCD sample.
-                   A newly exposed rock edge may cover a more distant object. */
-                if(object && depth[sy][sx]>=crestKey){
-                    alpha+=(end-y)*advance;y=end;continue;
-                }
-                int rock=!object && (sy*pixelSize+pixelSize/2)>=source.firstRow*bgPixel?light[sy][sx]:rim;
-                if(object)water=light[sy][sx];
-                uint8_t *byte=frame+y*stride+sxByte;
-                for(;y<end;y++,byte+=stride,alpha+=advance){
-                    int blend=max2(0,min2(4096,alpha));
-                    int value=water+(((rock-water)*blend)>>12);
-                    if(value>=whiteThreshold[y&3][x&3])*byte|=(uint8_t)bit;
-                    else *byte&=(uint8_t)~bit;
-                }
-            }
-        }
-    }
-}
-static void write_stamp(uint8_t *out,int stride,uint32_t block,int size){
-    out[0]=(uint8_t)block;out[stride]=(uint8_t)(block>>8);
-    if(size>=3)out[2*stride]=(uint8_t)(block>>16);
-    if(size==4)out[3*stride]=(uint8_t)(block>>24);
-}
-static inline uint32_t sample_stamp(const uint32_t *table,int phases,int x,
-                                    int center,int left,int right,int up,int down){
-    int tone=(20*center+3*(left+right+up+down))>>8;
-    int code=slopeX[255+right-left]+slopeY[255+down-up]+tone;
-    return table[code*phases+(x&(phases-1))];
-}
-static inline __attribute__((always_inline)) void pack_frame(uint8_t *frame,int stride,int size,int phases){
-    uint32_t row[WIDTH];
-    int w=(LCD_W+size-1)/size,h=LCD_H/size;
-    for(int y=0;y<h;y++){
-        const uint8_t *line=light[y],*up=light[max2(0,y-1)],*down=light[min2(h-1,y+1)];
-        const uint32_t *table=stamps+stamp_band(size,y);
-        row[0]=sample_stamp(table,phases,0,line[0],line[0],line[1],up[0],down[0]);
-        for(int x=1;x<w-1;x++)
-            row[x]=sample_stamp(table,phases,x,line[x],line[x-1],line[x+1],up[x],down[x]);
-        row[w-1]=sample_stamp(table,phases,w-1,line[w-1],line[w-2],line[w-1],up[w-1],down[w-1]);
-        uint8_t *out=frame+y*size*stride;
-        if(size==4){
-            for(int i=0;i<w;i+=2)write_stamp(out++,stride,(row[i]<<4)|row[i+1],4);
-        }else if(size==2){
-            for(int i=0;i<w;i+=4)
-                write_stamp(out++,stride,(row[i]<<6)|(row[i+1]<<4)|(row[i+2]<<2)|row[i+3],2);
-        }else{
-            for(int i=0;i<w;i+=8){
-                uint32_t *p=row+i;
-                write_stamp(out++,stride,(p[0]<<5)|(p[1]<<2)|((p[2]>>1)&0x030303),3);
-                write_stamp(out++,stride,((p[2]&0x010101)<<7)|(p[3]<<4)|(p[4]<<1)|((p[5]>>2)&0x010101),3);
-                if(i+7<w)
-                    write_stamp(out++,stride,((p[5]&0x030303)<<6)|(p[6]<<3)|p[7],3);
-            }
-        }
-    }
-}
-static void display_frame(uint8_t *frame,int stride){
-    if(pixelSize==2)pack_frame(frame,stride,2,2);
-    else if(pixelSize==3)pack_frame(frame,stride,3,4);
-    else pack_frame(frame,stride,4,1);
-}
-/* A terrain ray covers 2, alternately 2 or 3, or 4 foreground samples. */
-static void compose_background(int bgLevel){
-    const GridMap *m=&gridMaps[detailLevel];
-    int lanes=((LCD_W+3-bgLevel)/(4-bgLevel))/2;
-    if(detailLevel==DETAIL_FULL){
-        for(int y=0;y<viewHeight;y+=2)for(int i=0;i<lanes;i++){
-            int x=4*i;
-            uint32_t tone=groundLight[y/2][i]*0x01010101u;
-            uint32_t z=groundDepth[y/2][i]*0x00010001u;
-            for(int j=0;j<2;j++){
-                memcpy(&light[y+j][x],&tone,4);
-                memcpy(&depth[y+j][x],&z,4);
-                memcpy(&depth[y+j][x+2],&z,4);
-            }
-        }
-        for(int y=0;y<viewHeight/2;y+=2)for(int x=0;x<viewWidth/2;x+=2){
-            uint8_t w=waterTile[y/2][x/2];
-            openWater[y][x]=openWater[y][x+1]=openWater[y+1][x]=openWater[y+1][x+1]=w;
-        }
-        return;
-    }
-    for(int y=0;y<viewHeight;y++){
-        int sy=m->row[y];
-        uint8_t *l=light[y];uint16_t *d=depth[y];
-        if(y && sy==m->row[y-1]){
-            memcpy(l,light[y-1],viewWidth);memcpy(d,depth[y-1],viewWidth*sizeof(*d));continue;
-        }
-        const uint8_t *tone=groundLight[sy];const uint16_t *z=groundDepth[sy];
-        int x=0,i=0;
-        if(detailLevel==DETAIL_LOW){
-            for(;i<lanes;i++,x+=2){
-                l[x]=l[x+1]=tone[i];d[x]=d[x+1]=z[i];
-            }
-        }else{
-            for(;i+2<lanes;i+=3,x+=8){
-                l[x]=l[x+1]=l[x+2]=tone[i];d[x]=d[x+1]=d[x+2]=z[i];
-                l[x+3]=l[x+4]=tone[i+1];d[x+3]=d[x+4]=z[i+1];
-                l[x+5]=l[x+6]=l[x+7]=tone[i+2];d[x+5]=d[x+6]=d[x+7]=z[i+2];
-            }
-        }
-        for(;x<viewWidth;x++){l[x]=tone[m->lane[x]];d[x]=z[m->lane[x]];}
-    }
-    for(int y=0;y<viewHeight/2;y++){
-        const uint8_t *src=waterTile[m->waterY[y]];
-        if(detailLevel==DETAIL_LOW)memcpy(openWater[y],src,viewWidth/2);
-        else for(int x=0;x<viewWidth/2;x++)openWater[y][x]=src[m->waterX[x]];
-    }
+    init_tables();terrain_tables();
+    baking=1;build_canopy();baking=0;
+    build_landmarks();index_props();index_coral();ready=1;
 }
 void render(const Diver *d,uint8_t *frame,int stride){
     prepare_renderer();
+    lcd=frame;pitchBytes=stride;
     view=d;headingX=sinf(d->yaw);headingZ=cosf(d->yaw);
     horizon=60+focal*tanf(d->pitch)+sinf(d->time*1.3f)*.65f;
     tick=(int)(d->time*19);
-    int sceneLevel=detailLevel,bgLevel=DETAIL_LOW;
-    set_render_detail(bgLevel);
-    water();bottom();
-    set_render_detail(sceneLevel);
-    compose_background(bgLevel);
-    occlusion_tiles();
+    water();terrain();
+    memset(bucketHead,0xff,sizeof bucketHead);commandCount=0;
     Camera shipPos=camera((Vec){59.5f,-23,6}),flukePos=camera((Vec){-5,-38,-4});
     if(shipPos.z>-23 && shipPos.z<TERRAIN_RANGE+23 && fabsf(shipPos.x)<shipPos.z+42)draw_model(&landmarks[0]);
     if(flukePos.z>-10 && flukePos.z<TERRAIN_RANGE+10 && fabsf(flukePos.x)<flukePos.z+18)draw_model(&landmarks[1]);
@@ -1289,12 +1125,16 @@ void render(const Diver *d,uint8_t *frame,int stride){
         Camera p=camera((Vec){arches[i].x,arches[i].y,arches[i].z});
         if(p.z>-18 && p.z<TERRAIN_RANGE+18 && fabsf(p.x)<p.z+36)draw_model(&landmarks[2+i]);
     }
-    /* Preserve reef and landmark shading for the short-range fade. */
-    memcpy(bedLight,light,viewHeight*sizeof light[0]);
-    smallPass=1;
-    draw_plants();
-    animals();reef_life();marine_snow();
-    smallPass=0;
-    display_frame(frame,stride);
-    refine_skyline(frame,stride,bgLevel);
+    draw_plants();animals();reef_life();marine_snow();
+    for(int b=0;b<BUCKETS;b++)for(int id=bucketHead[b];id>=0;id=commands[id].next){
+        const Command *cmd=&commands[id];
+        switch(cmd->type){
+        case TRI_CMD:raster_triangle(cmd->v[0],cmd->v[1],cmd->v[2],cmd->tone);break;
+        case OVAL_CMD:raster_oval(cmd->oval.s,cmd->oval.x,cmd->oval.y,cmd->oval.rx,cmd->oval.ry,cmd->tone);break;
+        case KELP_CMD:raster_kelp(cmd->kelp.s,cmd->kelp.h,cmd->kelp.phase);break;
+        case CORAL_CMD:raster_coral(cmd->coral.p,cmd->coral.base,cmd->coral.variant);break;
+        case JELLY_CMD:raster_jelly(cmd->jelly.s,cmd->jelly.phase);break;
+        case SNOW_CMD:flat_span(cmd->snow.y,cmd->snow.x,cmd->snow.x+1,cmd->snow.key,cmd->tone);break;
+        }
+    }
 }

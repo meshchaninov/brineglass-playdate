@@ -21,8 +21,6 @@ float floor_at(float x,float z);
 void visit(Diver *d,int site);
 void swim(Diver *d,float forward,float steer,float rise,float look,float dt);
 void demo_pose(Diver *d,int site,float elapsed);
-enum { DETAIL_LOW, DETAIL_MIXED, DETAIL_FULL };
-void set_render_detail(int detail);
 void prepare_renderer(void);
 void render(const Diver *d, uint8_t *frame, int stride);
 #endif

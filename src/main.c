@@ -11,57 +11,35 @@ static PDSynth *voice,*bell;
 static int chart,selected=1,showFPS,sound=1,phrase;
 static float audioTimer=1,caption=2;
 static const int route[SITE_COUNT]={1,4,0,3,5,2};
-static int touring=1,shot,detail=DETAIL_LOW;
+static int touring=1,shot;
 static float shotTime;
-static int stable,promotionDelay=90;
-static float average;
-static void camera_cut(void){
-    /* The previous view's cost says little about newly visible geometry. */
-    detail=DETAIL_LOW;set_render_detail(detail);
-    stable=0;promotionDelay=18;
-}
-/* Hysteresis uses actual render time, independent of the display's frame limiter. */
-static void budget(uint32_t ms){
-    if(!stable)average=(float)ms;
-    else average+=((float)ms-average)*.125f;
-    if(stable<180)stable++;
-    /* Medium resolution can use a little more of the 33 ms refresh
-       interval before falling all the way back to 100 x 60. */
-    int peakLimit=detail==DETAIL_MIXED?36:35;
-    float meanLimit=detail==DETAIL_MIXED?31.4f:30.f;
-    if(detail>DETAIL_LOW && (ms>=peakLimit || (stable>=4 && average>meanLimit))){
-        set_render_detail(--detail);
-        stable=0;
-    }else if(detail<DETAIL_FULL && stable>=promotionDelay && ms<=26 &&
-             average<(detail==DETAIL_LOW?25.0f:22.0f)){
-        set_render_detail(++detail);
-        stable=0;promotionDelay=40;
-    }
-}
 #ifdef TARGET_SIMULATOR
 #define PLATFORM "sim"
 #else
 #define PLATFORM "device"
 #endif
-static unsigned timing[101],samples,totalMs,peakRenderMs,totalWork,qualityFrames[3],overBudget;
+static unsigned timing[101],samples,totalMs,peakRenderMs,totalWork,peakInterval,longIntervals,peakAt,overBudget;
 static void report_frame(uint32_t delta,uint32_t work){
     if(!touring)return;
+    if(delta>peakInterval)peakInterval=delta;
+    longIntervals+=delta>34;
     ++timing[delta<100?delta:100];++samples;totalMs+=delta;totalWork+=work;
-    qualityFrames[detail]++;overBudget+=work>33;
-    if(work>peakRenderMs)peakRenderMs=work;
+    overBudget+=work>33;
+    if(work>peakRenderMs){peakRenderMs=work;peakAt=samples;}
 }
 static void finish_shot(void){
     if(samples && totalMs){
         unsigned p95=0,count=0;
         while(p95<100 && count+timing[p95]<(samples*95+99)/100){count+=timing[p95];p95++;}
-        pd->system->logToConsole(PLATFORM " %s | %u frames / %u ms | p95 interval %u ms | peak render %u ms | total render %u ms | 2x/3x/4x %u/%u/%u | over 33 ms %u",
-            sites[route[shot]].name,samples,totalMs,p95,peakRenderMs,totalWork,qualityFrames[2],qualityFrames[1],qualityFrames[0],overBudget);
+        pd->system->logToConsole(PLATFORM " %s | %u frames / %u ms | p95 interval %u ms | max interval %u ms | intervals over 34 ms %u | peak work %u ms at frame %u | total work %u ms | over 33 ms %u",
+            sites[route[shot]].name,samples,totalMs,p95,peakInterval,longIntervals,peakRenderMs,peakAt,totalWork,overBudget);
     }
-    memset(qualityFrames,0,sizeof qualityFrames);overBudget=0;
-    memset(timing,0,sizeof timing);samples=totalMs=peakRenderMs=totalWork=0;
+    overBudget=0;
+    memset(timing,0,sizeof timing);
+    samples=totalMs=peakRenderMs=peakAt=peakInterval=longIntervals=totalWork=0;
 }
 static void start_shot(int index,float elapsed){
-    finish_shot();camera_cut();
+    finish_shot();
     shot=(index+SITE_COUNT)%SITE_COUNT;
     shotTime=elapsed;selected=route[shot];caption=1.5f;
 }
@@ -97,6 +75,20 @@ static void ambience(float dt){
 }
 static void text_at(const char *text,int x,int y){
     pd->graphics->drawText(text,strlen(text),kASCIIEncoding,x,y);
+}
+/* The two-second labels recur on every camera cut. Rasterize their glyphs
+   during loading so a new shot only blits opaque LCD pixels. */
+static LCDBitmap *siteLabel[SITE_COUNT],*tourHelp,*swimHelp;
+static LCDBitmap *make_label(const char *text,int width,int inset){
+    LCDBitmap *label=pd->graphics->newBitmap(width,22,kColorWhite);
+    if(label){
+        pd->graphics->pushContext(label);text_at(text,inset,2);pd->graphics->popContext();
+    }
+    return label;
+}
+static void draw_label(LCDBitmap *label,const char *text,int x,int width,int inset){
+    if(label)pd->graphics->drawBitmap(label,x,214,kBitmapUnflipped);
+    else{pd->graphics->fillRect(x,214,width,22,kColorWhite);text_at(text,x+inset,216);}
 }
 static int chart_x(float x){return 117+(int)(x*.65f);}
 static int chart_y(float z){return 115-(int)(z*.63f);}
@@ -151,7 +143,7 @@ static int update(void *ctx){
         if(press&(kButtonDown|kButtonRight))selected=(selected+1)%SITE_COUNT;
         if(press&(kButtonUp|kButtonLeft))selected=(selected+SITE_COUNT-1)%SITE_COUNT;
         if(press&kButtonA){
-            if(touring)tour_site(selected);else {visit(&diver,selected);camera_cut();}
+            if(touring)tour_site(selected);else {visit(&diver,selected);}
             chart=0;caption=2;
         }else{
             if(press){draw_chart();return 1;}
@@ -175,33 +167,28 @@ static int update(void *ctx){
         demo_pose(&diver,selected,shotTime);
         diver.time=shot*SHOT_SECONDS+shotTime;
     }else swim(&diver,vertical?0:move,steer,vertical?move:0,crank*.006f,dt);
-    uint32_t beforeRender=pd->system->getCurrentTimeMilliseconds();
     uint8_t *frame=pd->graphics->getFrame();
     render(&diver,frame,LCD_ROWSIZE);
     pd->graphics->markUpdatedRows(0,LCD_ROWS-1);
     if(caption>0){
-        pd->graphics->fillRect(6,214,154,22,kColorWhite);
-        text_at(sites[selected].name,12,216);
-        if(touring){
-            pd->graphics->fillRect(201,214,193,22,kColorWhite);
-            text_at("<> View   A Swim   B Map",205,216);
-        }else{
-            pd->graphics->fillRect(318,214,76,22,kColorWhite);
-            text_at("B  Chart",323,216);
-        }
+        draw_label(siteLabel[selected],sites[selected].name,6,154,6);
+        if(touring)draw_label(tourHelp,"<> View   A Swim   B Map",201,193,4);
+        else draw_label(swimHelp,"B  Chart",318,76,5);
         caption-=dt;
     }
     if(showFPS)pd->system->drawFPS(3,3);
     ambience(dt);
-    uint32_t work=pd->system->getCurrentTimeMilliseconds()-beforeRender;
+    uint32_t work=pd->system->getCurrentTimeMilliseconds()-now;
     report_frame(delta,work);
-    budget(work);
     return 1;
 }
 int eventHandler(PlaydateAPI *api,PDSystemEvent event,uint32_t arg){
     (void)arg;
     if(event==kEventInit){
-        pd=api;generate_world();set_render_detail(detail);prepare_renderer();visit(&diver,selected);
+        pd=api;generate_world();prepare_renderer();visit(&diver,selected);
+        for(int i=0;i<SITE_COUNT;i++)siteLabel[i]=make_label(sites[i].name,154,6);
+        tourHelp=make_label("<> View   A Swim   B Map",193,4);
+        swimHelp=make_label("B  Chart",76,5);
         pd->display->setRefreshRate(30);
         voice=pd->sound->synth->newSynth();bell=pd->sound->synth->newSynth();
         pd->sound->synth->setAttackTime(voice,.85f);pd->sound->synth->setReleaseTime(voice,1.5f);
